@@ -219,6 +219,15 @@ pub fn specs() -> Vec<CommandSpec> {
             has_doc,
             super::fileinfo::file_info
         ),
+        cmd!(
+            "render.overlay",
+            "Render Labeled Overlay",
+            [],
+            None,
+            "{path: string, scale?: float, node_ids?: [int], ungrouped_only?: bool} → {path, annotated_count, dimensions: {width, height}}",
+            has_doc,
+            render_overlay
+        ),
     ]
 }
 
@@ -618,3 +627,228 @@ fn close_all(s: &mut Session, _: &Value) -> Result<Value> {
     }
     Ok(json!({ "closed": n }))
 }
+
+// ---------- Render Overlay ----------
+
+// 3x5 bitmap glyphs for decimal digits '0'..='9'.
+// Each row has 3 bits (bits 2, 1, 0 from left to right).
+const DIGIT_GLYPHS_3X5: [[u8; 5]; 10] = [
+    [0b111, 0b101, 0b101, 0b101, 0b111], // 0
+    [0b010, 0b110, 0b010, 0b010, 0b111], // 1
+    [0b111, 0b001, 0b111, 0b100, 0b111], // 2
+    [0b111, 0b001, 0b111, 0b001, 0b111], // 3
+    [0b101, 0b101, 0b111, 0b001, 0b001], // 4
+    [0b111, 0b100, 0b111, 0b001, 0b111], // 5
+    [0b111, 0b100, 0b111, 0b101, 0b111], // 6
+    [0b111, 0b001, 0b001, 0b001, 0b001], // 7
+    [0b111, 0b101, 0b111, 0b101, 0b111], // 8
+    [0b111, 0b101, 0b111, 0b001, 0b111], // 9
+];
+
+fn blend_pixel(img: &mut image::RgbaImage, x: i32, y: i32, color: [u8; 4]) {
+    if x < 0 || y < 0 {
+        return;
+    }
+    let (ux, uy) = (x as u32, y as u32);
+    if ux >= img.width() || uy >= img.height() {
+        return;
+    }
+    let px = img.get_pixel_mut(ux, uy);
+    let sa = color[3] as u32;
+    if sa == 0 {
+        return;
+    }
+    if sa == 255 {
+        px.0 = color;
+        return;
+    }
+    let inv = 255 - sa;
+    let r = (color[0] as u32 * sa + px.0[0] as u32 * inv + 127) / 255;
+    let g = (color[1] as u32 * sa + px.0[1] as u32 * inv + 127) / 255;
+    let b = (color[2] as u32 * sa + px.0[2] as u32 * inv + 127) / 255;
+    let a = sa + (px.0[3] as u32 * inv + 127) / 255;
+    px.0 = [r.min(255) as u8, g.min(255) as u8, b.min(255) as u8, a.min(255) as u8];
+}
+
+pub(crate) fn render_overlay(s: &mut Session, p: &Value) -> Result<Value> {
+    let path = p.get("path").and_then(Value::as_str).ok_or_else(|| bad("render.overlay", "missing target path"))?;
+    let scale = match p.get("scale") {
+        Some(v) => {
+            let sc = v.as_f64().ok_or_else(|| bad("render.overlay", "scale must be a positive finite number"))?;
+            if !sc.is_finite() || sc <= 0.0 {
+                return Err(bad("render.overlay", "scale must be a positive finite number"));
+            }
+            sc
+        }
+        None => 2.0,
+    };
+
+    let doc = &s.doc()?.doc;
+    let artboard = doc.artboards.first().ok_or_else(|| bad("render.overlay", "document has no artboard"))?;
+
+    let mut targets: Vec<(NodeId, vectorcraft_geom::Rect)> = Vec::new();
+    if let Some(arr) = p.get("node_ids").and_then(Value::as_array) {
+        let mut seen = std::collections::HashSet::new();
+        for v in arr {
+            if let Some(id_num) = v.as_u64() {
+                let id = NodeId(id_num);
+                if seen.insert(id)
+                    && let Some(n) = doc.node(id)
+                    && let Some(bounds) = n.geometric_bounds()
+                {
+                    targets.push((n.id, bounds));
+                }
+            }
+        }
+    } else {
+        let ungrouped_only = bool_or(p, "ungrouped_only", false);
+        for layer in &doc.layers {
+            if let Some(children) = layer.children() {
+                for child in children {
+                    if ungrouped_only && matches!(child.kind, NodeKind::Group { .. }) {
+                        continue;
+                    }
+                    if let Some(bounds) = child.geometric_bounds() {
+                        targets.push((child.id, bounds));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut renderer = vectorcraft_render::Renderer::new();
+    let rendered = renderer.render_region(doc, artboard.rect, scale, true);
+    let mut img = image::RgbaImage::from_raw(rendered.width, rendered.height, rendered.to_straight())
+        .ok_or_else(|| bad("render.overlay", "invalid rendered image buffer"))?;
+
+    let w = img.width() as i32;
+    let h = img.height() as i32;
+
+    const TINT: [u8; 4] = [0, 150, 255, 40];
+    const BORDER: [u8; 4] = [0, 120, 240, 220];
+    const BADGE_BG: [u8; 4] = [20, 20, 30, 230];
+    const BADGE_BORDER: [u8; 4] = [0, 120, 240, 240];
+    const BADGE_TEXT: [u8; 4] = [255, 255, 255, 255];
+
+    let mut annotated = 0usize;
+
+    for (node_id, bounds) in targets {
+        if !bounds.x0.is_finite() || !bounds.y0.is_finite() || !bounds.x1.is_finite() || !bounds.y1.is_finite() {
+            continue;
+        }
+        if !artboard.rect.x0.is_finite() || !artboard.rect.y0.is_finite() {
+            continue;
+        }
+
+        let rx0 = ((bounds.x0 - artboard.rect.x0) * scale).round();
+        let ry0 = ((bounds.y0 - artboard.rect.y0) * scale).round();
+        let rx1 = ((bounds.x1 - artboard.rect.x0) * scale).round();
+        let ry1 = ((bounds.y1 - artboard.rect.y0) * scale).round();
+
+        if !rx0.is_finite() || !ry0.is_finite() || !rx1.is_finite() || !ry1.is_finite() {
+            continue;
+        }
+
+        let x0 = rx0 as i32;
+        let y0 = ry0 as i32;
+        let x1 = rx1 as i32;
+        let y1 = ry1 as i32;
+
+        let (bx0, bx1) = if x0 <= x1 { (x0, x1) } else { (x1, x0) };
+        let (by0, by1) = if y0 <= y1 { (y0, y1) } else { (y1, y0) };
+
+        // 1. Semi-transparent bounding box interior tint
+        let fill_x0 = bx0.clamp(0, w);
+        let fill_x1 = bx1.clamp(0, w);
+        let fill_y0 = by0.clamp(0, h);
+        let fill_y1 = by1.clamp(0, h);
+
+        for y in fill_y0..=fill_y1 {
+            for x in fill_x0..=fill_x1 {
+                blend_pixel(&mut img, x, y, TINT);
+            }
+        }
+
+        // 2. 1px bounding box border
+        for x in bx0..=bx1 {
+            blend_pixel(&mut img, x, by0, BORDER);
+            blend_pixel(&mut img, x, by1, BORDER);
+        }
+        for y in by0..=by1 {
+            blend_pixel(&mut img, bx0, y, BORDER);
+            blend_pixel(&mut img, bx1, y, BORDER);
+        }
+
+        // 3. Numbered badge displaying node_id
+        let text = node_id.0.to_string();
+        let num_digits = text.len() as i32;
+        // 3x5 font scaled 2x: digit is 6x10 px, spacing 2 px
+        let text_w = num_digits * 6 + (num_digits - 1).max(0) * 2;
+        let text_h = 10;
+        let pad_x = 3;
+        let pad_y = 2;
+        let badge_w = text_w + 2 * pad_x;
+        let badge_h = text_h + 2 * pad_y;
+
+        let badge_x = bx0.clamp(0, (w - badge_w).max(0));
+        let badge_y = by0.clamp(0, (h - badge_h).max(0));
+
+        // Draw badge background & border
+        for by in badge_y..badge_y + badge_h {
+            for bx in badge_x..badge_x + badge_w {
+                blend_pixel(&mut img, bx, by, BADGE_BG);
+            }
+        }
+        for bx in badge_x..badge_x + badge_w {
+            blend_pixel(&mut img, bx, badge_y, BADGE_BORDER);
+            blend_pixel(&mut img, bx, badge_y + badge_h - 1, BADGE_BORDER);
+        }
+        for by in badge_y..badge_y + badge_h {
+            blend_pixel(&mut img, badge_x, by, BADGE_BORDER);
+            blend_pixel(&mut img, badge_x + badge_w - 1, by, BADGE_BORDER);
+        }
+
+        // Draw badge digits (3x5 scaled 2x)
+        let mut cur_x = badge_x + pad_x;
+        let cur_y = badge_y + pad_y;
+        for c in text.chars() {
+            if let Some(digit) = c.to_digit(10)
+                && let Some(rows) = DIGIT_GLYPHS_3X5.get(digit as usize)
+            {
+                for (r_idx, row_bits) in rows.iter().enumerate() {
+                    for col in 0..3 {
+                        if (row_bits & (1 << (2 - col))) != 0 {
+                            let px = cur_x + col * 2;
+                            let py = cur_y + r_idx as i32 * 2;
+                            for dy in 0..2 {
+                                for dx in 0..2 {
+                                    blend_pixel(&mut img, px + dx, py + dy, BADGE_TEXT);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            cur_x += 6 + 2;
+        }
+
+        annotated += 1;
+    }
+
+    if let Some(parent) = std::path::Path::new(path).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|e| bad("render.overlay", format!("failed to create directory: {e}")))?;
+    }
+    img.save(path).map_err(|e| bad("render.overlay", format!("failed to save image: {e}")))?;
+
+    Ok(json!({
+        "path": path,
+        "annotated_count": annotated,
+        "dimensions": {
+            "width": img.width(),
+            "height": img.height()
+        }
+    }))
+}
+
