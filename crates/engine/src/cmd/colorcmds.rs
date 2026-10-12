@@ -117,6 +117,15 @@ pub fn specs() -> Vec<CommandSpec> {
             always,
             harmony
         ),
+        cmd!(
+            "color.cluster",
+            "Cluster by Color",
+            ["Object", "Color"],
+            None,
+            "{max_delta_e: float, action: 'preview'|'group', node_ids?: [int]}",
+            has_doc,
+            color_cluster
+        ),
     ]
 }
 
@@ -521,4 +530,82 @@ fn harmony(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let hex = |cs: &[Color]| cs.iter().map(Color::to_hex).collect::<Vec<_>>();
     Ok(json!({ "rule": rule.id(), "colors": hex(&g.colors), "grid": g.grid.iter().map(|r| hex(r)).collect::<Vec<_>>() }))
+}
+
+fn color_cluster(s: &mut Session, p: &Value) -> Result<Value> {
+    let max_delta_e = p.get("max_delta_e").and_then(Value::as_f64).ok_or_else(|| bad("color.cluster", "missing or invalid max_delta_e"))?;
+    if !max_delta_e.is_finite() || max_delta_e <= 0.0 {
+        return Err(bad("color.cluster", "max_delta_e must be a positive finite number"));
+    }
+    let action = p.get("action").and_then(Value::as_str).unwrap_or("preview");
+    if action != "preview" && action != "group" {
+        return Err(bad("color.cluster", "action must be 'preview' or 'group'"));
+    }
+
+    let doc_handle = s.doc()?;
+    let doc = &doc_handle.doc;
+    let target_ids: Vec<NodeId> = if let Some(arr) = p.get("node_ids").and_then(Value::as_array) {
+        arr.iter().filter_map(Value::as_u64).map(NodeId).collect()
+    } else {
+        doc.layers.iter().flat_map(|l| l.children().into_iter().flatten().map(|c| c.id)).collect()
+    };
+
+    let mut items: Vec<(u64, Color)> = Vec::new();
+    for &id in &target_ids {
+        if let Some(node) = doc.node(id)
+            && let Some(col) = node.appearance.fill_paint().color()
+        {
+            items.push((id.0, col));
+        }
+    }
+
+    let clusters = vectorcraft_color::recolor::cluster_colors_by_delta_e(&items, max_delta_e);
+    let cluster_json: Vec<Value> = clusters
+        .iter()
+        .map(|c| {
+            let [r, g, b, _] = c.representative.to_rgba8(1.0);
+            json!({
+                "group_name": format!("Color #{r:02x}{g:02x}{b:02x}"),
+                "hex": format!("#{r:02x}{g:02x}{b:02x}"),
+                "node_ids": c.node_ids,
+                "avg_delta_e": c.avg_delta_e
+            })
+        })
+        .collect();
+
+    if action == "preview" {
+        return Ok(json!({
+            "clusters": cluster_json,
+            "modified_node_count": 0
+        }));
+    }
+
+    if action == "group" {
+        let mut modified = 0;
+        s.edit("Cluster by Color", |d, _sel| {
+            for c in &clusters {
+                let [r, g, b, _] = c.representative.to_rgba8(1.0);
+                let group_name = format!("Color #{r:02x}{g:02x}{b:02x}");
+                let gid = d.alloc_id();
+                let mut gnode = Node::group(gid, vec![]);
+                gnode.name = Some(group_name);
+                if let Some(first_id) = c.node_ids.first()
+                    && let Some((par, idx, _)) = d.position(NodeId(*first_id))
+                {
+                    d.insert(par, idx + 1, gnode)?;
+                    for &nid in &c.node_ids {
+                        d.move_node(NodeId(nid), Some(gid), usize::MAX)?;
+                        modified += 1;
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        return Ok(json!({
+            "clusters": cluster_json,
+            "modified_node_count": modified
+        }));
+    }
+
+    Err(bad("color.cluster", "action must be 'preview' or 'group'"))
 }
