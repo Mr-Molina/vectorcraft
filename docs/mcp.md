@@ -188,6 +188,9 @@ objects' fills or strokes differ (`fillMixed` / `strokeMixed`, drawn as a "?" pr
 | `create_graph` | `{type?, x, y, width, height, csv? \| series?, categories?, rows?}` | The nine Illustrator graph types: column, stacked column, bar, stacked bar, line, area, scatter, pie and radar. Edit later with `graph.setData` / `graph.setType` via `run_command`. |
 | `text_wrap` | `{ids?, offset?, invert?, release?}` | Area type below the objects (same layer) flows around them. |
 | `undo` / `redo` | `{}` | |
+| `semantic_summary` | `{selection_only?, max_palette_entries?}` | Token-efficient summary of the active document: artboards, canvas background card ID, total group and loose path counts, and dominant palette frequency. |
+| `cluster_colors` | `{max_delta_e, action, node_ids?}` | Groups or previews nodes clustered by perceptual color distance (CIEDE2000). Action `'preview'` returns proposed clusters without mutating; action `'group'` creates new named color groups atomically. |
+| `render_overlay` | `{path, scale?, node_ids?, ungrouped_only?}` | Exports an annotated PNG image displaying semi-transparent bounding boxes and high-contrast numbered badges for nodes. |
 
 With `mods.shift`, a marquee dragged with the Selection tool toggles the objects it reaches (the selected ones leave
 the selection, the others join it, the rest stays), and one dragged with Direct or Group Selection toggles the anchors
