@@ -252,3 +252,70 @@ pub struct StrokeMixed {
     pub dash: bool,
     pub can_align: bool,
 }
+
+/// Semantic summary of the document for agent consumption.
+pub fn semantic_summary(s: &Session, p: &Value) -> Result<Value, crate::EngineError> {
+    let doc_handle = s.doc()?;
+    let doc = &doc_handle.doc;
+    let selection_only = p.get("selection_only").and_then(Value::as_bool).unwrap_or(false);
+    let max_palette = p.get("max_palette_entries").and_then(Value::as_u64).unwrap_or(32) as usize;
+
+    let artboard_rect = doc.artboards.first().map(|a| a.rect);
+    let mut bg_card_id = None;
+    let mut total_nodes = 0;
+    let mut group_count = 0;
+    let mut loose_paths = 0;
+    let mut palette_map: std::collections::BTreeMap<String, (usize, Vec<u64>)> = std::collections::BTreeMap::new();
+
+    for layer in &doc.layers {
+        let Some(children) = layer.children() else { continue };
+        for (idx, child) in children.iter().enumerate() {
+            if selection_only && !doc_handle.selection.contains(child.id) {
+                continue;
+            }
+            total_nodes += 1;
+            if child.is_container() {
+                group_count += 1;
+            } else {
+                loose_paths += 1;
+            }
+            if idx == 0
+                && bg_card_id.is_none()
+                && let (Some(ab), Some(gb)) = (artboard_rect, child.geometric_bounds())
+            {
+                let dw = (ab.width() - gb.width()).abs();
+                let dh = (ab.height() - gb.height()).abs();
+                if dw <= ab.width() * 0.02 && dh <= ab.height() * 0.02 {
+                    bg_card_id = Some(child.id.0);
+                }
+            }
+            let fill = child.appearance.fill_paint();
+            if !fill.is_none() {
+                let hex = fill.label();
+                let entry = palette_map.entry(hex).or_insert((0, Vec::new()));
+                entry.0 += 1;
+                if entry.1.len() < 5 {
+                    entry.1.push(child.id.0);
+                }
+            }
+        }
+    }
+
+    let palette: Vec<Value> = palette_map
+        .into_iter()
+        .take(max_palette)
+        .map(|(hex, (count, ids))| {
+            json!({ "hex": hex, "count": count, "sample_node_ids": ids })
+        })
+        .collect();
+
+    Ok(json!({
+        "artboard": artboard_rect.map(|r| json!({"width": r.width(), "height": r.height()})).unwrap_or(Value::Null),
+        "background_card_id": bg_card_id,
+        "total_nodes": total_nodes,
+        "group_count": group_count,
+        "loose_path_count": loose_paths,
+        "palette": palette
+    }))
+}
+

@@ -800,6 +800,11 @@ impl Default for Session {
 }
 
 impl Session {
+    /// Create a new headless session (alias for [`Session::new`]).
+    pub fn headless() -> Self {
+        Self::new()
+    }
+
     pub fn new() -> Self {
         // Placed documents are read by the native format's loader.
         vectorcraft_doc::placed_document::set_loader(cmd::place::document::read_document);
@@ -1002,6 +1007,11 @@ impl Session {
             self.after_command();
         }
         Ok(r)
+    }
+
+    /// Execute a command by id (alias for [`Session::execute`]).
+    pub fn run(&mut self, id: &str, params: &Value) -> Result<Value> {
+        self.execute(id, params)
     }
 
     /// Is the interface in Japanese? Then new type starts with em box top-to-top leading and em

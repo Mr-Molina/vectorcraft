@@ -29,6 +29,15 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!(query "document.find", "Find Objects", [], None, "{name?: substring of the Layers panel name, kind?: panel label such as Group, Path, Type or Image (exact), text?: substring of type content, limit?: max matches (default 100, 0 counts only)} → {matches: [{id, name, kind, path}], total}", has_doc, doc_find),
         cmd!(query "document.json", "Document JSON", [], None, "{} → complete document model", has_doc, |s, _| Ok(serde_json::to_value(&*s.doc()?.doc).unwrap_or(Value::Null))),
         cmd!(
+            query "document.semantic_summary",
+            "Semantic Document Summary",
+            [],
+            None,
+            "{selection_only?: bool, max_palette_entries?: int} -> token-efficient summary",
+            has_doc,
+            doc_semantic_summary
+        ),
+        cmd!(
             "document.setUnits",
             "Units",
             ["File", "Document Setup"],
@@ -123,6 +132,10 @@ fn doc_node(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let n = s.doc()?.doc.node(id).ok_or(EngineError::NoNode(id))?;
     if summary { Ok(inspect::node_summary_opts(n, opts)) } else { Ok(serde_json::to_value(n).unwrap_or(Value::Null)) }
+}
+
+fn doc_semantic_summary(s: &mut Session, p: &Value) -> Result<Value> {
+    crate::inspect::semantic_summary(s, p)
 }
 
 /// `depth` / `childLimit` for a summary read: absent (or null) means no limit.
