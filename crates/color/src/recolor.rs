@@ -419,6 +419,50 @@ impl Rng {
     }
 }
 
+/// A cluster of similar colours mapped to a representative colour and the node IDs possessing them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ColorCluster {
+    pub representative: Color,
+    pub node_ids: Vec<u64>,
+    pub avg_delta_e: f64,
+}
+
+/// Clusters colors by CIEDE2000 delta E threshold.
+pub fn cluster_colors_by_delta_e(items: &[(u64, Color)], max_delta_e: f64) -> Vec<ColorCluster> {
+    if items.is_empty() || !max_delta_e.is_finite() || max_delta_e <= 0.0 {
+        return Vec::new();
+    }
+    let mut out: Vec<ColorCluster> = Vec::new();
+    let items_lab: Vec<(u64, Color, Lab)> = items.iter().map(|&(id, c)| (id, c, c.to_lab())).collect();
+
+    for &(id, col, col_lab) in &items_lab {
+        let mut best_match: Option<(usize, f64)> = None;
+        for (i, cluster) in out.iter().enumerate() {
+            let rep_lab = cluster.representative.to_lab();
+            let de = delta_e2000(rep_lab, col_lab) as f64;
+            if de <= max_delta_e {
+                if let Some((_, best_de)) = best_match {
+                    if de < best_de {
+                        best_match = Some((i, de));
+                    }
+                } else {
+                    best_match = Some((i, de));
+                }
+            }
+        }
+
+        if let Some((idx, de)) = best_match {
+            let cl = &mut out[idx];
+            let old_len = cl.node_ids.len() as f64;
+            cl.avg_delta_e = (cl.avg_delta_e * old_len + de) / (old_len + 1.0);
+            cl.node_ids.push(id);
+        } else {
+            out.push(ColorCluster { representative: col, node_ids: vec![id], avg_delta_e: 0.0 });
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -582,5 +626,25 @@ mod tests {
         assert!(matches!(r, Color::Cmyk { .. }));
         assert!(matches!(Rng::new(3).saturation_brightness(Color::lab(50.0, 40.0, 20.0)), Color::Lab { .. }));
         assert_eq!(Rng::new(3).saturation_brightness(Color::gray(0.4)).to_hsb()[1], 0.0, "greys stay grey");
+    }
+
+    #[test]
+    fn test_cluster_colors_by_delta_e_threshold() {
+        let red1 = (1, Color::rgb(0.9, 0.1, 0.1));
+        let red2 = (2, Color::rgb(0.91, 0.11, 0.1));
+        let blue = (3, Color::rgb(0.1, 0.1, 0.9));
+        let clusters = cluster_colors_by_delta_e(&[red1, red2, blue], 5.0);
+        assert_eq!(clusters.len(), 2);
+        assert_eq!(clusters[0].node_ids, vec![1, 2]);
+        assert_eq!(clusters[1].node_ids, vec![3]);
+    }
+
+    #[test]
+    fn test_cluster_colors_rejects_non_finite_and_negative() {
+        let red = (1, Color::rgb(0.9, 0.1, 0.1));
+        assert!(cluster_colors_by_delta_e(&[red], f64::NAN).is_empty());
+        assert!(cluster_colors_by_delta_e(&[red], f64::INFINITY).is_empty());
+        assert!(cluster_colors_by_delta_e(&[red], -1.0).is_empty());
+        assert!(cluster_colors_by_delta_e(&[], 5.0).is_empty());
     }
 }
