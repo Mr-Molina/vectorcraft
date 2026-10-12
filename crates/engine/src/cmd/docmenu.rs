@@ -851,4 +851,3 @@ pub(crate) fn render_overlay(s: &mut Session, p: &Value) -> Result<Value> {
         }
     }))
 }
-

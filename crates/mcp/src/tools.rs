@@ -405,6 +405,48 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool("undo", "Undo", "Undo the last change (Edit → Undo).", empty(), false),
         tool("redo", "Redo", "Redo the last undone change (Edit → Redo).", empty(), false),
+        tool(
+            "semantic_summary",
+            "Get Semantic Document Summary",
+            "Returns a token-efficient summary of the active document: artboards, canvas background card ID, total group and loose path counts, and dominant palette frequency.",
+            obj(
+                json!({
+                    "selection_only": {"type": "boolean", "description": "Only summarize selected nodes"},
+                    "max_palette_entries": {"type": "integer", "description": "Maximum color swatches (default 32)"},
+                }),
+                &[],
+            ),
+            true,
+        ),
+        tool(
+            "cluster_colors",
+            "Cluster Nodes by Perceptual Color",
+            "Groups or previews nodes clustered by perceptual color distance (CIEDE2000). Action 'preview' returns proposed groups. Action 'group' creates new named color groups atomically.",
+            obj(
+                json!({
+                    "node_ids": {"type": "array", "items": {"type": "integer"}, "description": "Node IDs to cluster"},
+                    "max_delta_e": num("Perceptual color distance threshold (CIEDE2000)"),
+                    "action": {"type": "string", "enum": ["preview", "group"], "description": "Execution action ('preview' or 'group')"},
+                }),
+                &["max_delta_e", "action"],
+            ),
+            false,
+        ),
+        tool(
+            "render_overlay",
+            "Render Labeled Visual Overlay",
+            "Exports an annotated PNG image of the artboard displaying semi-transparent bounding boxes and high-contrast numbered badges for nodes.",
+            obj(
+                json!({
+                    "path": string("Target PNG file path"),
+                    "scale": num("Raster scale factor (default 2.0)"),
+                    "node_ids": {"type": "array", "items": {"type": "integer"}, "description": "Node IDs to label"},
+                    "ungrouped_only": {"type": "boolean", "description": "Only label ungrouped paths"},
+                }),
+                &["path"],
+            ),
+            true,
+        ),
     ]
 }
 
@@ -813,6 +855,9 @@ fn dispatch(b: &mut dyn Backend, name: &str, a: &Args) -> Result<ToolResult, Str
         }
         "undo" => j(exec(b, "edit.undo", json!({}))?),
         "redo" => j(exec(b, "edit.redo", json!({}))?),
+        "semantic_summary" => j(exec(b, "document.semantic_summary", Value::Object(a.clone()))?),
+        "cluster_colors" => j(exec(b, "color.cluster", Value::Object(a.clone()))?),
+        "render_overlay" => j(exec(b, "render.overlay", Value::Object(a.clone()))?),
         other => Err(format!("unknown tool `{other}` (see tools/list)")),
     }
 }

@@ -301,16 +301,12 @@ pub fn semantic_summary(s: &Session, p: &Value) -> Result<Value, crate::EngineEr
         }
     }
 
-    let palette: Vec<Value> = palette_map
-        .into_iter()
-        .take(max_palette)
-        .map(|(hex, (count, ids))| {
-            json!({ "hex": hex, "count": count, "sample_node_ids": ids })
-        })
-        .collect();
+    let palette: Vec<Value> =
+        palette_map.into_iter().take(max_palette).map(|(hex, (count, ids))| json!({ "hex": hex, "count": count, "sample_node_ids": ids })).collect();
 
     Ok(json!({
         "artboard": artboard_rect.map(|r| json!({"width": r.width(), "height": r.height()})).unwrap_or(Value::Null),
+        "artboard_count": doc.artboards.len(),
         "background_card_id": bg_card_id,
         "total_nodes": total_nodes,
         "group_count": group_count,
@@ -318,4 +314,3 @@ pub fn semantic_summary(s: &Session, p: &Value) -> Result<Value, crate::EngineEr
         "palette": palette
     }))
 }
-

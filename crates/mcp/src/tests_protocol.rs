@@ -3,7 +3,7 @@
 
 use serde_json::{Value, json};
 
-use crate::{Headless, PROMPTS, Server};
+use crate::{Headless, PROMPTS, Server, tool_definitions};
 
 fn server() -> Server {
     Server::new(Box::new(Headless::with_document()))
@@ -216,4 +216,51 @@ fn log_records_go_out_as_notifications_once_asked_for() {
     let last_reply = lines.iter().rposition(|l| l.get("id").is_some()).unwrap_or(0);
     assert!(lines[last_reply + 1..].iter().all(|l| l.get("id").is_none()), "{lines:?}");
     result(&mut s, 4, "logging/setLevel", json!({"level": null}));
+}
+
+// ---------- agent extensions ----------
+
+#[test]
+fn test_mcp_tools_include_agent_extensions() {
+    let defs = tool_definitions();
+    let names: Vec<&str> = defs.iter().filter_map(|t| t["name"].as_str()).collect();
+    assert!(names.contains(&"semantic_summary"), "missing semantic_summary in {names:?}");
+    assert!(names.contains(&"cluster_colors"), "missing cluster_colors in {names:?}");
+    assert!(names.contains(&"render_overlay"), "missing render_overlay in {names:?}");
+}
+
+#[test]
+fn test_mcp_semantic_summary_tool_call() {
+    let mut s = server();
+    let r = result(&mut s, 1, "tools/call", json!({"name": "semantic_summary", "arguments": {}}));
+    assert_eq!(r["isError"], false, "{r}");
+    let text = r["content"][0]["text"].as_str().expect("text content");
+    let val: Value = serde_json::from_str(text).expect("valid JSON response");
+    assert!(val.get("group_count").is_some(), "missing group_count: {val}");
+    assert!(val.get("loose_path_count").is_some(), "missing loose_path_count: {val}");
+    assert!(val.get("artboard_count").is_some(), "missing artboard_count: {val}");
+}
+
+#[test]
+fn test_mcp_cluster_colors_tool_call() {
+    let mut s = server();
+    rectangle(&mut s, 1);
+    tool(&mut s, 2, "draw_shape", json!({"shape": "ellipse", "x": 100, "y": 100, "width": 50, "height": 50}));
+    let r = result(&mut s, 3, "tools/call", json!({"name": "cluster_colors", "arguments": {"max_delta_e": 10.0, "action": "preview"}}));
+    assert_eq!(r["isError"], false, "{r}");
+    let text = r["content"][0]["text"].as_str().expect("text content");
+    let val: Value = serde_json::from_str(text).expect("valid JSON response");
+    assert!(val.get("clusters").and_then(Value::as_array).is_some(), "missing clusters array: {val}");
+}
+
+#[test]
+fn test_mcp_render_overlay_tool_call() {
+    let mut s = server();
+    rectangle(&mut s, 1);
+    let tmp_path = std::env::temp_dir().join(format!("test_mcp_render_overlay_{}.png", std::process::id()));
+    let tmp_str = tmp_path.to_str().expect("valid path string").to_string();
+    let r = result(&mut s, 2, "tools/call", json!({"name": "render_overlay", "arguments": {"path": tmp_str}}));
+    assert_eq!(r["isError"], false, "{r}");
+    assert!(tmp_path.exists(), "overlay image was not created at {:?}", tmp_path);
+    let _ = std::fs::remove_file(&tmp_path);
 }
