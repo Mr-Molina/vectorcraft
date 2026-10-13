@@ -21,7 +21,7 @@ pub mod proof;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use vectorcraft_doc::{AppearanceItem, Document, Node, NodeId, NodeKind, StrokeAlign, StrokeLayer, TextObject};
+use vectorcraft_doc::{AppearanceItem, Document, Node, NodeId, NodeKind, StrokeAlign, StrokeLayer, TextObject, TraceView};
 use vectorcraft_geom::{Affine, BezPath, FillRule, Rect, Shape};
 use vello_cpu::kurbo;
 use vello_cpu::peniko::{self, BlendMode, Compose, Mix};
@@ -637,7 +637,7 @@ impl Renderer {
             NodeKind::Layer { children, clip: false, .. } | NodeKind::Group { children, clip: false } if !fx::has_object_fx(a) => {
                 let mut acc: Option<Rect> = None;
                 for c in children {
-                    if c.visible {
+                    if c.visible || (is_trace_group(a) && matches!(a.trace_view(), TraceView::SourceImage | TraceView::OutlinesWithSource)) {
                         acc = vectorcraft_geom::union_opt(acc, self.bounds_of(c));
                     }
                 }
@@ -871,6 +871,45 @@ impl Renderer {
 
     /// What `n` draws inside its transparency group (`knockout`: its children knock each other out).
     fn draw_content(&mut self, ctx: &mut RenderContext, f: &Frame, n: &Node, knockout: bool) {
+        if is_trace_group(n) && !f.opts.outline {
+            let view = n.trace_view();
+            if let NodeKind::Group { children, .. } = &n.kind
+                && let Some((source_img, vector_paths)) = children.split_first()
+            {
+                match view {
+                    TraceView::TracingResult => {
+                        self.draw_children(ctx, f, vector_paths, knockout);
+                    }
+                    TraceView::TracingResultWithOutlines => {
+                        self.draw_children(ctx, f, vector_paths, knockout);
+                        for vp in vector_paths {
+                            if let Some(bp) = vp.stroke_path() {
+                                self.hairline(ctx, f, &bp, [0, 160, 255, 255]);
+                            }
+                        }
+                    }
+                    TraceView::Outlines => {
+                        for vp in vector_paths {
+                            if let Some(bp) = vp.stroke_path() {
+                                self.hairline(ctx, f, &bp, [0, 0, 0, 255]);
+                            }
+                        }
+                    }
+                    TraceView::OutlinesWithSource => {
+                        self.draw_node(ctx, f, source_img, true);
+                        for vp in vector_paths {
+                            if let Some(bp) = vp.stroke_path() {
+                                self.hairline(ctx, f, &bp, [0, 160, 255, 255]);
+                            }
+                        }
+                    }
+                    TraceView::SourceImage => {
+                        self.draw_node(ctx, f, source_img, true);
+                    }
+                }
+                return;
+            }
+        }
         match &n.kind {
             NodeKind::Layer { children, clip: false, .. } | NodeKind::Group { children, clip: false } => {
                 self.draw_children(ctx, f, children, knockout)
@@ -1453,6 +1492,13 @@ impl Renderer {
         self.images.insert(grey_key, pm.clone());
         Some(pm)
     }
+}
+
+/// Whether `n` is an Image Trace group: a non-clipping group named "Image Trace" whose first child is an Image.
+fn is_trace_group(n: &Node) -> bool {
+    matches!(n.kind, NodeKind::Group { clip: false, .. })
+        && n.name.as_deref() == Some("Image Trace")
+        && n.children().is_some_and(|c| c.first().is_some_and(|i| matches!(i.kind, NodeKind::Image(_))))
 }
 
 /// Can image node `n` (`im`) clipped by `region` be painted straight into the region: visible,
