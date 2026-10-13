@@ -3598,3 +3598,14 @@ axis	Both	Entrambi
 	Off: an editable copy of its art, embedded in this document.	Disattivato: una copia modificabile della sua grafica, incorporata in questo documento.
 	Images: link to the file instead of only embedding it.	Immagini: collega il file invece di incorporarlo soltanto.
 	VectorCraft documents: one locked object, updated when the file changes.	Documenti VectorCraft: un unico oggetto bloccato, aggiornato quando il file cambia.
+	Cluster by Color	Raggruppa per colore (cluster)
+	Group by Color	Raggruppa per colore
+	Render Labeled Overlay	Esegui rendering sovrapposizione con etichette
+	Semantic Document Summary	Riepilogo semantico del documento
+	View:	Visualizza:
+	View Source Image	Visualizza immagine sorgente
+	Tracing Result	Risultato ricalco
+	Tracing Result with Outlines	Risultato ricalco con contorni
+	Outlines	Contorni
+	Outlines with Source Image	Contorni con immagine sorgente
+	Source Image	Immagine sorgente

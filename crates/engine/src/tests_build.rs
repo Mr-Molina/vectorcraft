@@ -704,3 +704,102 @@ fn image_trace_object_remembers_its_settings() {
     let id = st.selection.in_paint_order(&st.doc)[0];
     assert!(st.doc.node(id).unwrap().trace.is_none());
 }
+
+#[test]
+fn test_image_trace_set_view_and_expand_invariants() {
+    let mut s = session();
+    let img = image_doc(&mut s);
+    let r = s.execute("imageTrace.make", &json!({"params": {"ignoreWhite": true}})).unwrap();
+    let trace_id = NodeId(r["id"].as_u64().unwrap());
+    assert_ne!(trace_id, img);
+
+    // For each mode, run imageTrace.setView, asserting doc.node(trace_id).unwrap().trace_view()
+    let modes = [
+        ("tracingResultWithOutlines", vectorcraft_doc::TraceView::TracingResultWithOutlines),
+        ("outlines", vectorcraft_doc::TraceView::Outlines),
+        ("outlinesWithSource", vectorcraft_doc::TraceView::OutlinesWithSource),
+        ("sourceImage", vectorcraft_doc::TraceView::SourceImage),
+        ("tracingResult", vectorcraft_doc::TraceView::TracingResult),
+    ];
+    for (mode_str, expected_view) in modes {
+        let res = s.execute("imageTrace.setView", &json!({"id": trace_id.0, "view": mode_str})).unwrap();
+        assert_eq!(res["view"], mode_str);
+        let n = s.doc().unwrap().doc.node(trace_id).unwrap();
+        assert_eq!(n.trace_view(), expected_view);
+    }
+
+    // Non-trace validation (Review Focus 2): Create shape.rectangle, call imageTrace.setView on it,
+    // assert error containing "select an Image Trace object".
+    let rect_id = rect(&mut s, 10.0, 10.0, 50.0, 50.0);
+    let err = s.execute("imageTrace.setView", &json!({"id": rect_id.0, "view": "outlines"})).unwrap_err();
+    assert!(err.to_string().contains("select an Image Trace object"), "err: {err}");
+
+    s.execute("select.set", &json!({"ids": [rect_id.0]})).unwrap();
+    let err_sel = s.execute("imageTrace.setView", &json!({"view": "outlines"})).unwrap_err();
+    assert!(err_sel.to_string().contains("select an Image Trace object"), "err: {err_sel}");
+
+    // Expand invariant (Review Focus 3): Switch trace to outlines, call imageTrace.expand,
+    // assert expanded.trace.is_none(), expanded.name.is_none(), children non-empty with !c.appearance.fill_paint().is_none().
+    s.execute("imageTrace.setView", &json!({"id": trace_id.0, "view": "outlines"})).unwrap();
+    assert_eq!(s.doc().unwrap().doc.node(trace_id).unwrap().trace_view(), vectorcraft_doc::TraceView::Outlines);
+    s.execute("imageTrace.expand", &json!({"id": trace_id.0})).unwrap();
+    let expanded = s.doc().unwrap().doc.node(trace_id).unwrap();
+    assert!(expanded.trace.is_none());
+    assert!(expanded.name.is_none());
+    let children = expanded.children().unwrap();
+    assert!(!children.is_empty());
+    assert!(children.iter().all(|c| !matches!(c.kind, NodeKind::Image(_))));
+    assert!(children.iter().all(|c| !c.appearance.fill_paint().is_none()));
+}
+
+#[test]
+fn test_image_trace_preview_coalescing() {
+    let mut s = session();
+    let img = image_doc(&mut s);
+    let initial_count = s.doc().unwrap().history.undo.len();
+
+    // Select image
+    s.execute("select.set", &json!({"ids": [img.0]})).unwrap();
+
+    // Emulate 4 rapid preview drag frames (preview: true with changing threshold)
+    let mut trace_id = img;
+    for th in [64, 96, 128, 160] {
+        let r = s
+            .execute(
+                "imageTrace.make",
+                &json!({
+                    "id": trace_id.0,
+                    "preview": true,
+                    "params": { "threshold": th }
+                }),
+            )
+            .unwrap();
+        trace_id = NodeId(r["id"].as_u64().unwrap());
+    }
+
+    // Commit final drag release with preview: false
+    let r = s
+        .execute(
+            "imageTrace.make",
+            &json!({
+                "id": trace_id.0,
+                "preview": false,
+                "params": { "threshold": 192 }
+            }),
+        )
+        .unwrap();
+    let final_trace_id = NodeId(r["id"].as_u64().unwrap());
+
+    // Assert s.doc().unwrap().history.undo.len() == initial_count + 1
+    assert_eq!(s.doc().unwrap().history.undo.len(), initial_count + 1, "all preview frames coalesced into 1 undo step");
+
+    // Run edit.undo once, assert doc node reverts to original image
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(s.doc().unwrap().history.undo.len(), initial_count);
+
+    let doc = &s.doc().unwrap().doc;
+    assert!(doc.node(final_trace_id).is_none() || final_trace_id == img);
+    let orig = doc.node(img).expect("original image restored");
+    assert!(matches!(orig.kind, NodeKind::Image(_)));
+    assert!(orig.visible);
+}

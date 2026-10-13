@@ -15,7 +15,7 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 use vectorcraft_color::{Color, Paint};
 use vectorcraft_doc::appearance::{AppearanceItem, FillLayer, StrokeLayer};
-use vectorcraft_doc::{Appearance, Document, Node, NodeId, NodeKind, Selection};
+use vectorcraft_doc::{Appearance, Document, Node, NodeId, NodeKind, Selection, TraceView};
 use vectorcraft_geom::{FillRule, PathData, Point, Rect, SubPath};
 use vectorcraft_pathops as po;
 use vectorcraft_tools::builder::{
@@ -150,6 +150,15 @@ pub fn specs() -> Vec<CommandSpec> {
             "{id?} keep only the traced paths (drop the source image) → {ids}",
             has_selection_or_ids,
             trace_expand
+        ),
+        cmd!(
+            "imageTrace.setView",
+            "View",
+            ["Object", "Image Trace"],
+            None,
+            "{id?: NodeId, view: \"tracingResult\"|\"tracingResultWithOutlines\"|\"outlines\"|\"outlinesWithSource\"|\"sourceImage\"} set Image Trace display mode",
+            has_selection_or_ids,
+            trace_set_view
         ),
         cmd!(query "imageTrace.presets", "Image Trace Presets", [], None, "{} → {presets: [{name, params}]}", always, |_, _| {
             Ok(json!({ "presets": tr::presets().into_iter().map(|(n, p)| json!({ "name": n, "params": p })).collect::<Vec<_>>() }))
@@ -647,6 +656,10 @@ pub const MAX_TRACE_ANCHORS: usize = 2_000_000;
 
 fn trace_make(s: &mut Session, p: &Value, expand: bool) -> Result<Value> {
     const C: &str = "imageTrace.make";
+    let preview = p.get("preview").and_then(Value::as_bool).unwrap_or(false);
+    if preview && s.active().is_some_and(|st| st.undo_group.is_none()) {
+        s.begin_undo_group();
+    }
     let params = trace_params(p)?;
     let params_json = serde_json::to_value(&params).map_err(|e| EngineError::Other(e.to_string()))?;
     // The preset's name if the parameters are exactly that preset's, else "Custom".
@@ -674,6 +687,9 @@ fn trace_make(s: &mut Session, p: &Value, expand: bool) -> Result<Value> {
             })
             .ok_or_else(|| bad(C, "select an image (or an Image Trace group)"))?
     };
+    let view_override: Option<TraceView> = p.get("view").and_then(|v| serde_json::from_value(v.clone()).ok());
+    let existing_view = s.doc()?.doc.node(target).map(|n| n.trace_view()).unwrap_or_default();
+    let active_view = view_override.unwrap_or(existing_view);
     let blob = s.doc()?.doc.images.get(&img.key).ok_or_else(|| EngineError::Other(format!("image data `{}` is missing", img.key)))?;
     let raster = tr::Raster::decode(&blob.bytes).map_err(|e| EngineError::Other(e.to_string()))?;
     let res = tr::trace_within(&raster, &params, MAX_TRACE_ANCHORS).map_err(|e| EngineError::Other(e.to_string()))?;
@@ -710,7 +726,11 @@ fn trace_make(s: &mut Session, p: &Value, expand: bool) -> Result<Value> {
         let mut g = Node::group(gid, children);
         g.name = if expand { None } else { Some(TRACE_NAME.into()) };
         if !expand {
-            g.trace = Some(Box::new(json!({ "preset": preset_label, "params": params_json })));
+            let mut trace_meta = json!({ "preset": preset_label, "params": params_json });
+            if let Ok(v) = serde_json::to_value(active_view) {
+                trace_meta["view"] = v;
+            }
+            g.trace = Some(Box::new(trace_meta));
         }
         let (par, idx, _) = d.position(target).ok_or(EngineError::NoNode(target))?;
         d.remove(target)?;
@@ -718,6 +738,9 @@ fn trace_make(s: &mut Session, p: &Value, expand: bool) -> Result<Value> {
         sel.set([gid]);
         Ok(gid)
     })?;
+    if !preview && s.active().is_some_and(|st| st.undo_group.is_some()) {
+        s.end_undo_group(false);
+    }
     Ok(json!({ "id": id.0, "paths": npaths, "anchors": anchors, "colors": colors }))
 }
 
@@ -761,4 +784,19 @@ fn trace_expand(s: &mut Session, p: &Value) -> Result<Value> {
         Ok(())
     })?;
     Ok(json!({ "ids": ids_json(&targets) }))
+}
+
+fn trace_set_view(s: &mut Session, p: &Value) -> Result<Value> {
+    const C: &str = "imageTrace.setView";
+    let view_str = str_param(p, "view").ok_or_else(|| bad(C, "missing view"))?;
+    let view: TraceView = serde_json::from_value(json!(view_str)).map_err(|e| bad(C, format!("unknown view `{view_str}`: {e}")))?;
+    let targets = trace_targets(s, p)?;
+    s.edit("Image Trace View Mode", |d, _| {
+        for id in &targets {
+            let n = d.node_mut(*id).ok_or(EngineError::NoNode(*id))?;
+            n.set_trace_view(view);
+        }
+        Ok(())
+    })?;
+    Ok(json!({ "ids": ids_json(&targets), "view": view_str }))
 }
