@@ -30,6 +30,7 @@ struct TraceUi {
     /// aren't overwritten until the object changes).
     synced: Value,
     view: String,
+    prev_view: String,
     preview: bool,
     last_drag_time: f64,
 }
@@ -42,6 +43,7 @@ impl Default for TraceUi {
             info: None,
             synced: Value::Null,
             view: "tracingResult".into(),
+            prev_view: "tracingResult".into(),
             preview: true,
             last_drag_time: 0.0,
         }
@@ -190,9 +192,15 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
         st.preset = t["preset"].as_str().unwrap_or("Custom").to_string();
         st.params = t["params"].clone();
         if let Some(v) = t.get("view").and_then(Value::as_str) {
+            if v != "sourceImage" {
+                st.prev_view = v.to_string();
+            }
             st.view = v.to_string();
         }
         st.synced = t;
+    }
+    if st.view != "sourceImage" {
+        st.prev_view = st.view.clone();
     }
     let mut retrace = false;
 
@@ -211,8 +219,13 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
         // Eyeball toggle button for quick source inspection
         let is_source = st.view == "sourceImage";
         if widgets::icon_button(ui, "eye", tl!("View Source Image"), is_source, 22.0).clicked() {
-            let new_view = if is_source { "tracingResult" } else { "sourceImage" };
-            st.view = new_view.to_string();
+            let new_view = if is_source {
+                if st.prev_view.is_empty() || st.prev_view == "sourceImage" { "tracingResult".to_string() } else { st.prev_view.clone() }
+            } else {
+                st.prev_view = st.view.clone();
+                "sourceImage".to_string()
+            };
+            st.view = new_view.clone();
             let _ = app.run("imageTrace.setView", json!({ "view": new_view }));
         }
     });
@@ -244,7 +257,7 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
             trace(app, &mut st, true);
         }
     }
-    if release && is_trace {
+    if release && is_trace && st.preview {
         trace(app, &mut st, false);
     }
 
@@ -267,7 +280,7 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
                     trace(app, &mut st, true);
                 }
             }
-            if release && is_trace {
+            if release && is_trace && st.preview {
                 trace(app, &mut st, false);
             }
         }
