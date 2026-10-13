@@ -155,12 +155,17 @@ fn image_section(app: &mut VectorcraftApp, ui: &mut Ui) {
 }
 
 /// The one selected Image Trace object: its preset (choosing another traces it again with that
-/// one), Expand and Release.
+/// one), view mode, Expand and Release.
 fn trace_section(app: &mut VectorcraftApp, ui: &mut Ui, preset: &str) {
     section_header(ui, tl!("Image Trace"));
     ui.horizontal(|ui| {
         dim_label(ui, tl!("Preset:"));
         crate::panels::image_trace::preset_dropdown(app, ui, preset, ui.available_width());
+    });
+    let view = crate::panels::image_trace::selected_view(app).unwrap_or_else(|| "tracingResult".into());
+    ui.horizontal(|ui| {
+        dim_label(ui, tl!("View:"));
+        crate::panels::image_trace::view_dropdown(app, ui, &view, ui.available_width());
     });
     let w = (ui.available_width() - 6.0) / 2.0;
     ui.horizontal(|ui| {
