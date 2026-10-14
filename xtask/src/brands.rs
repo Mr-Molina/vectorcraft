@@ -89,6 +89,8 @@ enum Kind {
 }
 
 fn kind_of(path: &str) -> Option<Kind> {
+    let norm = path.replace('\\', "/");
+    let path = norm.as_str();
     if (path.starts_with("docs/") && !path.ends_with(".md")) || path.starts_with("packaging/") {
         Some(Kind::Text)
     } else if path == "Cargo.toml" || path.ends_with("/Cargo.toml") {
@@ -101,7 +103,8 @@ fn kind_of(path: &str) -> Option<Kind> {
 }
 
 fn is_test_path(path: &str) -> bool {
-    let mut parts = path.split('/').rev();
+    let norm = path.replace('\\', "/");
+    let mut parts = norm.split('/').rev();
     let file = parts.next().unwrap_or_default();
     file == "tests.rs" || file.starts_with("tests_") || file.ends_with("_tests.rs") || parts.any(|d| d == "tests" || d == "benches")
 }
@@ -343,14 +346,20 @@ line Pantone"; }
     #[test]
     fn scope() {
         assert_eq!(kind_of("crates/engine/src/cmd/file.rs"), Some(Kind::Rust));
+        assert_eq!(kind_of(r"crates\engine\src\cmd\file.rs"), Some(Kind::Rust));
         assert_eq!(kind_of("crates/engine/src/tests_file.rs"), None);
+        assert_eq!(kind_of(r"crates\engine\src\tests_file.rs"), None);
         assert_eq!(kind_of("crates/tools/src/text_tests.rs"), None);
         assert_eq!(kind_of("crates/color/src/cms/tests.rs"), None);
         assert_eq!(kind_of("crates/engine/tests/command_sweep.rs"), None);
+        assert_eq!(kind_of(r"crates\engine\tests\command_sweep.rs"), None);
         assert_eq!(kind_of(SELF), None);
         assert_eq!(kind_of("crates/ui-egui/Cargo.toml"), Some(Kind::Manifest));
+        assert_eq!(kind_of(r"crates\ui-egui\Cargo.toml"), Some(Kind::Manifest));
         assert_eq!(kind_of("docs/brand/LICENSE-brand.txt"), Some(Kind::Text));
+        assert_eq!(kind_of(r"docs\brand\LICENSE-brand.txt"), Some(Kind::Text));
         assert_eq!(kind_of("packaging/linux/nfpm.yaml"), Some(Kind::Text));
+        assert_eq!(kind_of(r"packaging\linux\nfpm.yaml"), Some(Kind::Text));
         for skipped in ["README.md", "ROADMAP.md", "CLAUDE.md", "AGENTS.md", ".github/workflows/release.yml", "ASSETS.md", "docs/mcp.md"] {
             assert_eq!(kind_of(skipped), None, "{skipped}");
         }

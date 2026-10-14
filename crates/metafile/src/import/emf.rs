@@ -60,6 +60,10 @@ fn polys(r: &mut Reader, wide: bool) -> Option<Vec<Vec<Point>>> {
         return None;
     }
     let counts: Vec<u32> = (0..n).map(|_| r.u32()).collect::<Option<_>>()?;
+    let sum = counts.iter().try_fold(0usize, |acc, &c| acc.checked_add(c as usize))?;
+    if sum > total as usize {
+        return None;
+    }
     let mut all = points(r, total, wide)?.into_iter();
     Some(counts.iter().map(|c| all.by_ref().take(*c as usize).collect()).collect())
 }
@@ -86,9 +90,14 @@ fn bitmap(rec: &[u8], off_bmi: u32, cb_bmi: u32, off_bits: u32, cb_bits: u32, al
 
 /// The rows a DIB's source rectangle counts from the bottom in (StretchDIBits on a bottom-up DIB).
 fn bottom_up(rec: &[u8], off_bmi: u32) -> bool {
-    let at = off_bmi as usize;
-    let size = rec.get(at..at + 4).and_then(|b| b.try_into().ok()).map(u32::from_le_bytes);
-    let height = rec.get(at + 8..at + 12).and_then(|b| b.try_into().ok()).map(i32::from_le_bytes);
+    if off_bmi == 0 {
+        return true;
+    }
+    let Some(at) = usize::try_from(off_bmi).ok() else {
+        return true;
+    };
+    let size = at.checked_add(4).and_then(|end| rec.get(at..end)).and_then(|b| b.try_into().ok()).map(u32::from_le_bytes);
+    let height = at.checked_add(12).and_then(|end| rec.get(at.checked_add(8)?..end)).and_then(|b| b.try_into().ok()).map(i32::from_le_bytes);
     size.is_some_and(|s| s >= 40) && height.is_some_and(|h| h > 0)
 }
 
@@ -144,10 +153,22 @@ pub(super) fn play(bytes: &[u8]) -> Result<Imported, String> {
     let mut p = Player::new(Kind::Emf, dev_to_doc, mm_per_px, artboard);
     let mut at = 0usize;
     let mut ended = false;
-    while let Some(head) = bytes.get(at..at + 8) {
-        let kind = u32::from_le_bytes([head[0], head[1], head[2], head[3]]);
-        let size = u32::from_le_bytes([head[4], head[5], head[6], head[7]]) as usize;
-        let Some(rec) = bytes.get(at..at.saturating_add(size)).filter(|_| size >= 8) else { break };
+    while let Some(hdr_end) = at.checked_add(8) {
+        let Some(head) = bytes.get(at..hdr_end) else {
+            break;
+        };
+        let Some(kind_bytes) = head.get(..4).and_then(|b| b.try_into().ok()) else {
+            break;
+        };
+        let kind = u32::from_le_bytes(kind_bytes);
+        let Some(size_bytes) = head.get(4..8).and_then(|b| b.try_into().ok()) else {
+            break;
+        };
+        let size = u32::from_le_bytes(size_bytes) as usize;
+        let Some(end) = at.checked_add(size) else {
+            break;
+        };
+        let Some(rec) = bytes.get(at..end).filter(|_| size >= 8) else { break };
         if kind == 14 {
             ended = true;
             break;
@@ -158,7 +179,7 @@ pub(super) fn play(bytes: &[u8]) -> Result<Imported, String> {
         if record(&mut p, kind, rec).is_none() {
             p.skip();
         }
-        at += size;
+        at = end;
     }
     if !ended {
         p.warn("the file ends early: what it held was imported");
@@ -232,7 +253,12 @@ fn record(p: &mut Player, kind: u32, rec: &[u8]) -> Option<()> {
         45..=47 => {
             let b = rect(&mut r)?;
             let (s, e) = (point32(&mut r)?, point32(&mut r)?);
-            p.arc(b, s, e, [ArcKind::Open, ArcKind::Chord, ArcKind::Pie][(kind - 45) as usize]);
+            let kind = match kind {
+                45 => ArcKind::Open,
+                46 => ArcKind::Chord,
+                _ => ArcKind::Pie,
+            };
+            p.arc(b, s, e, kind);
         }
         49 | 99 | 122 => p.create_at(r.u32()?, Obj::Other),
         54 => {
@@ -251,8 +277,7 @@ fn record(p: &mut Player, kind: u32, rec: &[u8]) -> Option<()> {
         68 => p.abort_path(),
         70 => {
             // EMF+ records ride in comments starting "EMF+".
-            r.skip(4)?;
-            if r.u32()? == 0x2B46_4D45 {
+            if r.skip(4).is_some() && r.u32() == Some(0x2B46_4D45) {
                 p.emf_plus = true;
             }
         }

@@ -1,0 +1,243 @@
+﻿diff --git a/crates/engine/src/cmd/edit.rs b/crates/engine/src/cmd/edit.rs
+index d52008e..90cb404 100644
+--- a/crates/engine/src/cmd/edit.rs
++++ b/crates/engine/src/cmd/edit.rs
+@@ -21,20 +21,29 @@ pub fn specs() -> Vec<CommandSpec> {
+             "{preset?: a name from file.newPresets (start from it; the other params change it), name?|title?: document name (default Untitled-N), width?: pt=612|\"210 mm\", height?: pt=792, units?: \"Pixels\"|\"Points\"|\"Picas\"|\"Inches\"|\"Millimeters\"|\"Centimeters\"|\"Feet\"|\"Yards\"|\"Meters\"|\"Feet & Inches\" (default: prefs unitsGeneral, as print presets; screen presets: Pixels), orientation?: \"portrait\"|\"landscape\" (swaps width and height to match), artboards?: n (1ΓÇô1000), artboardLayout?: {layout?: \"gridByRow\"|\"gridByColumn\"|\"row\"|\"column\", columns?: n (default: all in one row), spacing?: pt=20, rightToLeft?: bool}, bleed?: pt|[top, bottom, left, right]|{top?, ΓÇª} (0ΓÇô72 pt), backgroundContents?: \"transparent\"|\"white\" (a white artboard background, not an object), colorMode?: \"rgb\"|\"cmyk\" (a CMYK document starts with CMYK swatches and stores the colours applied to it as CMYK), rasterEffectsPpi?: 72|150|300 (1ΓÇô2400), previewMode?: \"default\"|\"pixel\"|\"overprint\" (overprint turns Overprint Preview on, pixel Pixel Preview in the app; default leaves both), created?: Unix seconds|null (File Info's created date; default now, recorded in the journal so a replay matches)} ΓåÆ {index, previewMode}; the size is remembered in file.newPresets' Recent",
+             always,
+             super::newdoc::file_new
+         ),
+         cmd!("file.close", "Close", ["File"], Some("Cmd+W"), "{index?}", has_doc, file_close),
+         cmd!("document.activate", "Activate Document", [], None, "{index}", always, doc_activate),
+         cmd!(query "document.inspect", "Inspect Document", [], None, "{depth?, childLimit?} ΓåÆ layer tree, artboards, selection, history (a sliced tree reports childCount)", has_doc, |s, p| Ok(inspect::document_opts(s, slice_opts(p, "document.inspect")?))),
+         cmd!(query "document.node", "Inspect Object", [], None, "{id, summary?: compact summary, depth?: child levels in the summary (default all), childLimit?: children shown per node (default all; a level that shows fewer reports childCount)} ΓåÆ one object", has_doc, doc_node),
+         cmd!(query "document.find", "Find Objects", [], None, "{name?: substring of the Layers panel name, kind?: panel label such as Group, Path, Type or Image (exact), text?: substring of type content, limit?: max matches (default 100, 0 counts only)} ΓåÆ {matches: [{id, name, kind, path}], total}", has_doc, doc_find),
+         cmd!(query "document.json", "Document JSON", [], None, "{} ΓåÆ complete document model", has_doc, |s, _| Ok(serde_json::to_value(&*s.doc()?.doc).unwrap_or(Value::Null))),
++        cmd!(
++            query "document.semantic_summary",
++            "Semantic Document Summary",
++            [],
++            None,
++            "{selection_only?: bool, max_palette_entries?: int} -> token-efficient summary",
++            has_doc,
++            doc_semantic_summary
++        ),
+         cmd!(
+             "document.setUnits",
+             "Units",
+             ["File", "Document Setup"],
+             None,
+             "{units: \"Points\"|\"Picas\"|\"Inches\"|\"Millimeters\"|\"Centimeters\"|\"Pixels\"|\"Feet & Inches\"|\"Meters\"|\"Yards\"|\"Feet\"} the document's units: every length the UI shows and reads (General)",
+             has_doc,
+             set_units
+         ),
+         cmd!("edit.undo", "Undo", ["Edit"], Some("Cmd+Z"), "{}", can_undo, undo),
+@@ -118,20 +127,24 @@ fn doc_node(s: &mut Session, p: &Value) -> Result<Value> {
+     let summary = bool_or(p, "summary", false);
+     if !summary && (opts.depth.is_some() || opts.child_limit.is_some()) {
+         // The full object JSON is never truncated: a slice without `summary` would
+         // otherwise silently return the whole subtree.
+         return Err(bad("document.node", "`depth` and `childLimit` slice the summary: pass `summary: true`"));
+     }
+     let n = s.doc()?.doc.node(id).ok_or(EngineError::NoNode(id))?;
+     if summary { Ok(inspect::node_summary_opts(n, opts)) } else { Ok(serde_json::to_value(n).unwrap_or(Value::Null)) }
+ }
+ 
++fn doc_semantic_summary(s: &mut Session, p: &Value) -> Result<Value> {
++    crate::inspect::semantic_summary(s, p)
++}
++
+ /// `depth` / `childLimit` for a summary read: absent (or null) means no limit.
+ fn slice_opts(p: &Value, cmd: &str) -> Result<inspect::SummaryOpts> {
+     Ok(inspect::SummaryOpts { depth: opt_u64(p, cmd, "depth")?, child_limit: opt_u64(p, cmd, "childLimit")? })
+ }
+ 
+ /// An optional count: absent (or null) is `None`; a present value that is not a
+ /// non-negative integer is rejected rather than silently reinterpreted.
+ fn opt_u64(p: &Value, cmd: &str, key: &str) -> Result<Option<u64>> {
+     match p.get(key) {
+         None | Some(Value::Null) => Ok(None),
+diff --git a/crates/engine/src/inspect.rs b/crates/engine/src/inspect.rs
+index 89f9fe1..649ee01 100644
+--- a/crates/engine/src/inspect.rs
++++ b/crates/engine/src/inspect.rs
+@@ -245,10 +245,77 @@ pub fn stroke_options(st: &StrokeLayer) -> Value {
+ #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+ pub struct StrokeMixed {
+     pub weight: bool,
+     pub cap: bool,
+     pub join: bool,
+     pub miter_limit: bool,
+     pub align: bool,
+     pub dash: bool,
+     pub can_align: bool,
+ }
++
++/// Semantic summary of the document for agent consumption.
++pub fn semantic_summary(s: &Session, p: &Value) -> Result<Value, crate::EngineError> {
++    let doc_handle = s.doc()?;
++    let doc = &doc_handle.doc;
++    let selection_only = p.get("selection_only").and_then(Value::as_bool).unwrap_or(false);
++    let max_palette = p.get("max_palette_entries").and_then(Value::as_u64).unwrap_or(32) as usize;
++
++    let artboard_rect = doc.artboards.first().map(|a| a.rect);
++    let mut bg_card_id = None;
++    let mut total_nodes = 0;
++    let mut group_count = 0;
++    let mut loose_paths = 0;
++    let mut palette_map: std::collections::BTreeMap<String, (usize, Vec<u64>)> = std::collections::BTreeMap::new();
++
++    for layer in &doc.layers {
++        let Some(children) = layer.children() else { continue };
++        for (idx, child) in children.iter().enumerate() {
++            if selection_only && !doc_handle.selection.contains(child.id) {
++                continue;
++            }
++            total_nodes += 1;
++            if child.is_container() {
++                group_count += 1;
++            } else {
++                loose_paths += 1;
++            }
++            if idx == 0
++                && bg_card_id.is_none()
++                && let (Some(ab), Some(gb)) = (artboard_rect, child.geometric_bounds())
++            {
++                let dw = (ab.width() - gb.width()).abs();
++                let dh = (ab.height() - gb.height()).abs();
++                if dw <= ab.width() * 0.02 && dh <= ab.height() * 0.02 {
++                    bg_card_id = Some(child.id.0);
++                }
++            }
++            let fill = child.appearance.fill_paint();
++            if !fill.is_none() {
++                let hex = fill.label();
++                let entry = palette_map.entry(hex).or_insert((0, Vec::new()));
++                entry.0 += 1;
++                if entry.1.len() < 5 {
++                    entry.1.push(child.id.0);
++                }
++            }
++        }
++    }
++
++    let palette: Vec<Value> = palette_map
++        .into_iter()
++        .take(max_palette)
++        .map(|(hex, (count, ids))| {
++            json!({ "hex": hex, "count": count, "sample_node_ids": ids })
++        })
++        .collect();
++
++    Ok(json!({
++        "artboard": artboard_rect.map(|r| json!({"width": r.width(), "height": r.height()})).unwrap_or(Value::Null),
++        "background_card_id": bg_card_id,
++        "total_nodes": total_nodes,
++        "group_count": group_count,
++        "loose_path_count": loose_paths,
++        "palette": palette
++    }))
++}
++
+diff --git a/crates/engine/src/lib.rs b/crates/engine/src/lib.rs
+index 874cb74..78dfda7 100644
+--- a/crates/engine/src/lib.rs
++++ b/crates/engine/src/lib.rs
+@@ -793,20 +793,25 @@ pub struct Session {
+     pub(crate) ruler_guide: Option<vectorcraft_tools::rulerguide::NewGuide>,
+ }
+ 
+ impl Default for Session {
+     fn default() -> Self {
+         Self::new()
+     }
+ }
+ 
+ impl Session {
++    /// Create a new headless session (alias for [`Session::new`]).
++    pub fn headless() -> Self {
++        Self::new()
++    }
++
+     pub fn new() -> Self {
+         // Placed documents are read by the native format's loader.
+         vectorcraft_doc::placed_document::set_loader(cmd::place::document::read_document);
+         vectorcraft_doc::placed_document::set_file_reader(cmd::place::document::read_file_again);
+         Self {
+             docs: vec![],
+             active: None,
+             prefs: Prefs::default(),
+             paint: PaintDefaults::default(),
+             fill_active: true,
+@@ -997,20 +1002,25 @@ impl Session {
+         if spec.journal && self.depth == 0 && self.active().is_none_or(|d| d.interaction.is_none()) {
+             let p = self.noted(params);
+             self.journal.push((id.to_string(), p));
+         }
+         if self.depth == 0 {
+             self.after_command();
+         }
+         Ok(r)
+     }
+ 
++    /// Execute a command by id (alias for [`Session::execute`]).
++    pub fn run(&mut self, id: &str, params: &Value) -> Result<Value> {
++        self.execute(id, params)
++    }
++
+     /// Is the interface in Japanese? Then new type starts with em box top-to-top leading and em
+     /// box centre character alignment (#432).
+     pub fn japanese_interface(&self) -> bool {
+         self.ui_language.as_deref().unwrap_or(&self.prefs.interface_language).eq_ignore_ascii_case("ja")
+     }
+ 
+     /// Record `key: value` in the running top-level command's journal entry (or its interaction's
+     /// preview, or its step in a batch) unless its params give `key`: a value it resolved from the
+     /// preferences or the clock.
+     pub fn note_journal(&mut self, key: &str, value: Value) {
+diff --git a/crates/engine/tests/semantic_summary_test.rs b/crates/engine/tests/semantic_summary_test.rs
+new file mode 100644
+index 0000000..173f824
+--- /dev/null
++++ b/crates/engine/tests/semantic_summary_test.rs
+@@ -0,0 +1,40 @@
++//! Integration tests for `document.semantic_summary`.
++#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
++
++use serde_json::json;
++use vectorcraft_engine::Session;
++
++#[test]
++fn test_semantic_summary_detects_background_and_palette() {
++    let mut s = Session::headless();
++    s.run("file.new", &json!({"width": 500, "height": 500})).unwrap();
++    s.run("shape.rectangle", &json!({"x": 0, "y": 0, "width": 500, "height": 500})).unwrap();
++    s.run("shape.ellipse", &json!({"x": 100, "y": 100, "width": 50, "height": 50})).unwrap();
++
++    let summary = s.run("document.semantic_summary", &json!({})).unwrap();
++    assert_eq!(summary["total_nodes"], 2);
++    assert!(summary["background_card_id"].is_number());
++    assert!(!summary["palette"].as_array().unwrap().is_empty());
++}
++
++#[test]
++fn test_semantic_summary_artboard_divergence_fallback() {
++    let mut s = Session::headless();
++    s.run("file.new", &json!({"width": 300, "height": 300})).unwrap();
++    s.run("shape.rectangle", &json!({"x": 10, "y": 10, "width": 50, "height": 50})).unwrap();
++    let summary = s.run("document.semantic_summary", &json!({})).unwrap();
++    assert!(summary["background_card_id"].is_null());
++    assert_eq!(summary["total_nodes"], 1);
++}
++
++#[test]
++fn test_semantic_summary_selection_only() {
++    let mut s = Session::headless();
++    s.run("file.new", &json!({"width": 400, "height": 400})).unwrap();
++    let _r1 = s.run("shape.rectangle", &json!({"x": 10, "y": 10, "width": 50, "height": 50})).unwrap();
++    let r2 = s.run("shape.ellipse", &json!({"x": 100, "y": 100, "width": 50, "height": 50})).unwrap();
++    s.run("select.set", &json!({"ids": [r2["id"]]})).unwrap();
++
++    let summary = s.run("document.semantic_summary", &json!({"selection_only": true})).unwrap();
++    assert_eq!(summary["total_nodes"], 1);
++}

@@ -1,0 +1,29 @@
+# Pattern Library — Tracks known failure patterns for recurrence detection
+# Managed by the improvement skill. Do not edit manually.
+schema_version: 1
+
+patterns:
+- id: VEC-001
+  name: Toolchain Target Pre-Check for WebAssembly
+  failure_type: build
+  root_cause_category: toolchain_missing_target
+  description: When executing `cargo xtask wasm` or diagnosing wasm build failures in VectorCraft, agents MUST verify that `wasm32-unknown-unknown` is installed on the host toolchain via `rustup target list --installed` before diagnosing code defects, or execute `rustup target add wasm32-unknown-unknown`.
+  escalation_level: 1
+  current_mitigation: advisory
+  mitigation_target: S:\Github\vectorcraft\.agents\pattern-library.yaml
+  occurrences:
+  - session: conversation://02ad97f4-d4b1-4821-ae87-76a8ec00c42d
+    date: '2026-10-13'
+    postmortem_ref: PM-2026-1013-001
+- id: VEC-002
+  name: Engine Command and Error Literal i18n Synchronization
+  failure_type: build
+  root_cause_category: i18n_catalog_drift
+  description: In VectorCraft, `ui-egui` CI tests strictly require 100% translation coverage for all command labels in `command_specs()` across complete languages (`ja`, `es`, `it`, `zh-hans`, `zh-hant`, `pt-br`, `cs`) and every `EngineError::Other(...)` literal across `es` and `it`. When introducing new commands or errors, agents MUST reuse existing translated strings or append translations to all 7 language TSVs in `crates/ui-egui/src/i18n/`.
+  escalation_level: 1
+  current_mitigation: advisory
+  mitigation_target: S:\Github\vectorcraft\.agents\pattern-library.yaml
+  occurrences:
+  - session: conversation://02ad97f4-d4b1-4821-ae87-76a8ec00c42d
+    date: '2026-10-13'
+    postmortem_ref: PM-2026-1013-002

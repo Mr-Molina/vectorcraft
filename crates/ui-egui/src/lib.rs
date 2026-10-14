@@ -575,7 +575,10 @@ impl VectorcraftApp {
 
     fn drain_control(&mut self, ctx: &egui::Context) {
         let Some(rx) = self.control_rx.take() else { return };
-        while let Ok(req) = rx.try_recv() {
+        for _ in 0..64 {
+            let Ok(req) = rx.try_recv() else {
+                break;
+            };
             let reply = req.reply.clone();
             // Guarded per request: a panic must not drop the channel (taken out of `self` above).
             let outcome = vectorcraft_engine::guard::catch_panic(|| control::handle(self, ctx, &req))

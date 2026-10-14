@@ -100,11 +100,14 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "inspect_document",
             "Inspect document",
-            "Summary of the active document: artboards, layer tree (ids, names, kinds, bounds, fill/stroke), selection, undo history, current tool and default paint. On a large document pass depth: 0 for the layer skeleton (truncated levels report childCount), then locate objects with run_command document.find and read them with document.node.",
+            "Summary of the active document: artboards, layer tree (ids, names, kinds, bounds, fill/stroke), selection, undo history, current tool and default paint. On a large document pass depth: 0 for the layer skeleton (truncated levels report childCount), then locate objects with run_command document.find and read them with document.node. summary: true returns a compact semantic summary instead (artboard count and size, background card id, node/group/loose-path/hidden counts, dominant fill palette with sample ids): a cheap first look at an unfamiliar document.",
             obj(
                 json!({
                     "depth": {"type": "integer", "minimum": 0, "description": "Child levels of the layer tree to include (default all; 0 = top layers with counts)"},
-                    "childLimit": {"type": "integer", "minimum": 0, "description": "Children shown per node (default all; a level that shows fewer reports childCount)"}
+                    "childLimit": {"type": "integer", "minimum": 0, "description": "Children shown per node (default all; a level that shows fewer reports childCount)"},
+                    "summary": {"type": "boolean", "description": "Return a compact semantic summary (counts, artboard, dominant palette) instead of the layer tree"},
+                    "selectionOnly": {"type": "boolean", "description": "Summarize only the selection (summary only)"},
+                    "maxPalette": {"type": "integer", "minimum": 0, "maximum": 256, "description": "Most palette entries returned (summary only)"}
                 }),
                 &[],
             ),
@@ -246,13 +249,16 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "screenshot",
             "Screenshot",
-            "Render the active artboard to PNG and return it as an image (optionally also saving it to `path`). With window:true (desktop app only) captures the whole app window instead.",
+            "Render the active artboard to PNG and return it as an image (optionally also saving it to `path`). With overlay:true, numbered id badges and bounding boxes are drawn on the objects (all, `ids`, or only ungrouped ones) so you can refer to what you see by id; the reply's annotatedCount says how many were labelled. With window:true (desktop app only) captures the whole app window instead.",
             obj(
                 json!({
                     "path": string("Also write the PNG here"),
-                    "scale": num("Pixels per point (default 1)"),
+                    "scale": {"type": "number", "exclusiveMinimum": 0, "description": "Pixels per point (default 1)"},
                     "artboard": {"type": "integer", "minimum": 0, "description": "Artboard index (default 0)"},
                     "window": {"type": "boolean", "description": "Capture the app window (desktop app only)"},
+                    "overlay": {"type": "boolean", "description": "Draw numbered id badges and bounding boxes on objects"},
+                    "ids": {"type": "array", "items": {"type": "integer"}, "description": "Objects to label (overlay only; default: all)"},
+                    "ungroupedOnly": {"type": "boolean", "description": "Label only objects that aren't in a group (overlay only)"},
                 }),
                 &[],
             ),
@@ -405,48 +411,6 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool("undo", "Undo", "Undo the last change (Edit → Undo).", empty(), false),
         tool("redo", "Redo", "Redo the last undone change (Edit → Redo).", empty(), false),
-        tool(
-            "semantic_summary",
-            "Get Semantic Document Summary",
-            "Returns a token-efficient summary of the active document: artboards, canvas background card ID, total group and loose path counts, and dominant palette frequency.",
-            obj(
-                json!({
-                    "selection_only": {"type": "boolean", "description": "Only summarize selected nodes"},
-                    "max_palette_entries": {"type": "integer", "description": "Maximum color swatches (default 32)"},
-                }),
-                &[],
-            ),
-            true,
-        ),
-        tool(
-            "cluster_colors",
-            "Cluster Nodes by Perceptual Color",
-            "Groups or previews nodes clustered by perceptual color distance (CIEDE2000). Action 'preview' returns proposed groups. Action 'group' creates new named color groups atomically.",
-            obj(
-                json!({
-                    "node_ids": {"type": "array", "items": {"type": "integer"}, "description": "Node IDs to cluster"},
-                    "max_delta_e": num("Perceptual color distance threshold (CIEDE2000)"),
-                    "action": {"type": "string", "enum": ["preview", "group"], "description": "Execution action ('preview' or 'group')"},
-                }),
-                &["max_delta_e", "action"],
-            ),
-            false,
-        ),
-        tool(
-            "render_overlay",
-            "Render Labeled Visual Overlay",
-            "Exports an annotated PNG image of the artboard displaying semi-transparent bounding boxes and high-contrast numbered badges for nodes.",
-            obj(
-                json!({
-                    "path": string("Target PNG file path"),
-                    "scale": num("Raster scale factor (default 2.0)"),
-                    "node_ids": {"type": "array", "items": {"type": "integer"}, "description": "Node IDs to label"},
-                    "ungrouped_only": {"type": "boolean", "description": "Only label ungrouped paths"},
-                }),
-                &["path"],
-            ),
-            true,
-        ),
     ]
 }
 
@@ -534,7 +498,13 @@ fn draw_path(b: &mut dyn Backend, a: &Args) -> Result<Value, String> {
         p["closed"] = json!(a.get("closed").and_then(Value::as_bool).unwrap_or(false));
     }
     let r = exec(b, "path.create", p)?;
-    let paint = apply_paint(b, a, created_id(&r))?;
+    let paint = match apply_paint(b, a, created_id(&r)) {
+        Ok(paint) => paint,
+        Err(e) => {
+            let _ = exec(b, "edit.undo", json!({}));
+            return Err(e);
+        }
+    };
     Ok(json!({"id": r.get("id"), "paint": paint}))
 }
 
@@ -553,7 +523,13 @@ fn draw_shape(b: &mut dyn Backend, a: &Args) -> Result<Value, String> {
         p.remove(k);
     }
     let r = exec(b, cmd, Value::Object(p))?;
-    let paint = apply_paint(b, a, created_id(&r))?;
+    let paint = match apply_paint(b, a, created_id(&r)) {
+        Ok(paint) => paint,
+        Err(e) => {
+            let _ = exec(b, "edit.undo", json!({}));
+            return Err(e);
+        }
+    };
     Ok(json!({"id": r.get("id"), "shape": shape, "paint": paint}))
 }
 
@@ -641,24 +617,56 @@ fn transform(b: &mut dyn Backend, a: &Args) -> Result<Value, String> {
     Ok(json!({"applied": done}))
 }
 
+static SHOT_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn sanitize_path(raw: &str) -> Result<String, String> {
+    if raw.trim().is_empty() {
+        return Err("path cannot be empty".to_string());
+    }
+    if raw.contains('\0') {
+        return Err("path contains null byte".to_string());
+    }
+    let p = std::path::Path::new(raw);
+    for component in p.components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return Err("path traversal ('..') is not allowed".to_string());
+        }
+    }
+    Ok(raw.to_string())
+}
+
 fn screenshot(b: &mut dyn Backend, a: &Args) -> Result<ToolResult, String> {
-    let path = a.get("path").and_then(Value::as_str);
-    if a.get("window").and_then(Value::as_bool) == Some(true) {
+    let path = match a.get("path").and_then(Value::as_str) {
+        Some(p) => Some(sanitize_path(p)?),
+        None => None,
+    };
+    let window = a.get("window").and_then(Value::as_bool) == Some(true);
+    let overlay = match a.get("overlay") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(o)) => *o,
+        Some(_) => return Err("`overlay` must be a boolean".into()),
+    };
+    if overlay && window {
+        return Err("overlay can't be combined with window".into());
+    }
+    if window {
         need_ui(b, "screenshot {window:true}")?;
         // The app writes the capture to disk (loopback: same machine), then we read it back.
         let tmp;
-        let target = match path {
-            Some(p) => p,
+        let target = match &path {
+            Some(p) => p.as_str(),
             None => {
-                tmp = std::env::temp_dir().join(format!("vectorcraft-window-{}.png", std::process::id())).to_string_lossy().to_string();
+                let count = SHOT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tmp = std::env::temp_dir().join(format!("vectorcraft-mcp-shot-{}-{}.png", std::process::id(), count)).to_string_lossy().to_string();
                 &tmp
             }
         };
         let r = b.call("ui.screenshot", json!({"path": target}))?;
-        let png = std::fs::read(target).map_err(|e| format!("read {target}: {e}"))?;
+        let png = std::fs::read(target);
         if path.is_none() {
-            std::fs::remove_file(target).ok();
+            let _ = std::fs::remove_file(target);
         }
+        let png = png.map_err(|e| format!("read {target}: {e}"))?;
         return Ok(image_result(&png, json!({"window": true, "width": r.get("width"), "height": r.get("height"), "path": path})));
     }
     let mut p = json!({});
@@ -667,17 +675,33 @@ fn screenshot(b: &mut dyn Backend, a: &Args) -> Result<ToolResult, String> {
             p[k] = v.clone();
         }
     }
+    if overlay {
+        // The engine command validates these; `path` stays on this side so both branches
+        // write the file the same way.
+        for k in ["ids", "ungroupedOnly"] {
+            if let Some(v) = a.get(k) {
+                p[k] = v.clone();
+            }
+        }
+        let r = exec(b, "render.overlay", p)?;
+        let info = json!({"width": r.get("width"), "height": r.get("height"), "path": path, "annotatedCount": r.get("annotatedCount")});
+        return rendered_result(&r, path.as_deref(), info);
+    }
     let r = b.call("ui.render", p)?;
+    let info = json!({"width": r.get("width"), "height": r.get("height"), "path": path});
+    rendered_result(&r, path.as_deref(), info)
+}
+
+/// A `{pngBase64, …}` render reply → image block + `info` text block, also writing the PNG to
+/// `path` when given.
+fn rendered_result(r: &Value, path: Option<&str>, info: Value) -> Result<ToolResult, String> {
     let b64 = r.get("pngBase64").and_then(Value::as_str).ok_or("renderer returned no image")?;
     if let Some(path) = path {
         let png = vectorcraft_format::base64_decode(b64).ok_or("renderer returned bad base64")?;
         std::fs::write(path, png).map_err(|e| format!("write {path}: {e}"))?;
     }
     Ok(ToolResult {
-        content: vec![
-            json!({"type": "image", "data": b64, "mimeType": "image/png"}),
-            json!({"type": "text", "text": json!({"width": r.get("width"), "height": r.get("height"), "path": path}).to_string()}),
-        ],
+        content: vec![json!({"type": "image", "data": b64, "mimeType": "image/png"}), json!({"type": "text", "text": info.to_string()})],
         is_error: false,
     })
 }
@@ -732,10 +756,20 @@ fn dispatch(b: &mut dyn Backend, name: &str, a: &Args) -> Result<ToolResult, Str
             j(b.call(method, json!({"command": cmd, "params": params}))?)
         }
         "inspect_document" => {
-            // Only the slicing options reach the command, which validates them.
-            let slice: Map<String, Value> =
-                a.iter().filter(|(k, _)| matches!(k.as_str(), "depth" | "childLimit")).map(|(k, v)| (k.clone(), v.clone())).collect();
-            j(b.call("document.inspect", Value::Object(slice))?)
+            let summary = match a.get("summary") {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(s)) => *s,
+                Some(_) => return Err("`summary` must be a boolean".into()),
+            };
+            // Only each mode's own options reach its command, which validates them.
+            let only = |keys: &[&str]| -> Value {
+                Value::Object(a.iter().filter(|(k, _)| keys.contains(&k.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect())
+            };
+            if summary {
+                j(exec(b, "document.semantic_summary", only(&["selectionOnly", "maxPalette"]))?)
+            } else {
+                j(b.call("document.inspect", only(&["depth", "childLimit"]))?)
+            }
         }
         "inspect_ui" => {
             need_ui(b, name)?;
@@ -797,8 +831,17 @@ fn dispatch(b: &mut dyn Backend, name: &str, a: &Args) -> Result<ToolResult, Str
             j(b.call("ui.set", json!({"panel": req_str(a, "panel")?}))?)
         }
         "screenshot" => screenshot(b, a),
-        "open_file" => j(b.call("app.open", json!({"path": req_str(a, "path")?}))?),
-        "save_file" => j(b.call("app.save", json!({"path": a.get("path").and_then(Value::as_str)}))?),
+        "open_file" => {
+            let path = sanitize_path(req_str(a, "path")?)?;
+            j(b.call("app.open", json!({"path": path}))?)
+        }
+        "save_file" => {
+            let path = match a.get("path").and_then(Value::as_str) {
+                Some(p) => Some(sanitize_path(p)?),
+                None => None,
+            };
+            j(b.call("app.save", json!({"path": path}))?)
+        }
         "export" => {
             // One params object for every backend; the named arguments win over `options` (a named
             // artboard or range replaces every artboard choice in `options`).
@@ -810,8 +853,18 @@ fn dispatch(b: &mut dyn Backend, name: &str, a: &Args) -> Result<ToolResult, Str
             }
             for k in ["path", "format", "scale", "artboard", "range", "outlineText"] {
                 if let Some(v) = a.get(k).filter(|v| !v.is_null()) {
-                    params.insert(k.into(), v.clone());
+                    if k == "path" {
+                        let raw = v.as_str().ok_or("`path` must be a string")?;
+                        let sanitized = sanitize_path(raw)?;
+                        params.insert(k.into(), Value::String(sanitized));
+                    } else {
+                        params.insert(k.into(), v.clone());
+                    }
                 }
+            }
+            if let Some(p) = params.get("path").and_then(Value::as_str) {
+                let sanitized = sanitize_path(p)?;
+                params.insert("path".into(), Value::String(sanitized));
             }
             let cmd = if a.get("selection").and_then(Value::as_bool) == Some(true) { "document.exportSelection" } else { "document.export" };
             j(exec(b, cmd, Value::Object(params))?)
@@ -829,8 +882,13 @@ fn dispatch(b: &mut dyn Backend, name: &str, a: &Args) -> Result<ToolResult, Str
             j(exec(b, "effect.apply", p)?)
         }
         "pathfinder" => {
+            let op = req_str(a, "operation")?;
+            const VALID_OPS: &[&str] = &["unite", "minusFront", "intersect", "exclude", "divide", "trim", "merge", "crop", "outline", "minusBack"];
+            if !VALID_OPS.contains(&op) {
+                return Err(format!("unknown pathfinder operation: {op}"));
+            }
             select_ids(b, a)?;
-            j(exec(b, &format!("object.pathfinder.{}", req_str(a, "operation")?), json!({}))?)
+            j(exec(b, &format!("object.pathfinder.{op}"), json!({}))?)
         }
         "transform" => j(transform(b, a)?),
         "create_graph" => {
@@ -855,9 +913,6 @@ fn dispatch(b: &mut dyn Backend, name: &str, a: &Args) -> Result<ToolResult, Str
         }
         "undo" => j(exec(b, "edit.undo", json!({}))?),
         "redo" => j(exec(b, "edit.redo", json!({}))?),
-        "semantic_summary" => j(exec(b, "document.semantic_summary", Value::Object(a.clone()))?),
-        "cluster_colors" => j(exec(b, "color.cluster", Value::Object(a.clone()))?),
-        "render_overlay" => j(exec(b, "render.overlay", Value::Object(a.clone()))?),
         other => Err(format!("unknown tool `{other}` (see tools/list)")),
     }
 }

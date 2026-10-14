@@ -19,7 +19,7 @@ use vectorcraft_ui_egui::ControlRequest;
 
 /// Longest accepted request line (bytes, without the newline). Requests are small JSON objects;
 /// anything longer is refused and the connection closed.
-pub const MAX_LINE: usize = 4 * 1024 * 1024;
+pub const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 /// Connections served at once; further ones get an error line and are closed.
 pub const MAX_CONNECTIONS: usize = 16;
 
@@ -50,13 +50,15 @@ fn accept_loop(listener: TcpListener, tx: Sender<ControlRequest>, ctx: egui::Con
         let ctx = ctx.clone();
         let open = Arc::clone(&open);
         std::thread::spawn(move || {
-            serve(stream, &tx, &ctx);
+            serve_client(stream, &tx, &ctx);
             open.fetch_sub(1, Ordering::SeqCst);
         });
     }
 }
 
-fn serve(stream: TcpStream, tx: &Sender<ControlRequest>, ctx: &egui::Context) {
+pub fn serve_client(stream: TcpStream, tx: &Sender<ControlRequest>, ctx: &egui::Context) {
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(30)));
     let Ok(read) = stream.try_clone() else { return };
     serve_lines(read, stream, |method, params| {
         let (req, rrx) = ControlRequest::new(method, params);
@@ -79,6 +81,10 @@ enum Line {
 }
 
 fn parse_line(bytes: &[u8]) -> Line {
+    parse_line_with_token(bytes, std::env::var("VECTORCRAFT_CONTROL_TOKEN").ok().as_deref())
+}
+
+fn parse_line_with_token(bytes: &[u8], token_env: Option<&str>) -> Line {
     let Ok(text) = std::str::from_utf8(bytes) else {
         return Line::Reject("not a control request (invalid UTF-8); closing the connection".into());
     };
@@ -93,6 +99,12 @@ fn parse_line(bytes: &[u8]) -> Line {
     let Some(obj) = msg.as_object() else {
         return Line::Reject("not a control request (expected a JSON object); closing the connection".into());
     };
+    if let Some(expected) = token_env.filter(|s| !s.is_empty()) {
+        let provided = obj.get("token").and_then(Value::as_str);
+        if provided != Some(expected) {
+            return Line::Reject("unauthorized: missing or invalid control token; closing the connection".into());
+        }
+    }
     let Some(method) = obj.get("method").and_then(Value::as_str) else {
         return Line::Reject("not a control request (missing string `method`); closing the connection".into());
     };
@@ -109,7 +121,7 @@ fn read_bounded_line(reader: &mut impl BufRead, buf: &mut Vec<u8>, max: usize) -
     buf.clear();
     // `take` bounds the bytes buffered for one line: a peer can't make us allocate more than `max`.
     let limit = u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1);
-    let n = reader.take(limit).read_until(b'\n', buf).map_err(|e| e.to_string())?;
+    let n = std::io::Read::take(reader, limit).read_until(b'\n', buf).map_err(|e| e.to_string())?;
     if n == 0 {
         return Ok(false);
     }
@@ -134,7 +146,7 @@ fn serve_lines<R: Read, W: Write>(read: R, mut out: W, mut handle: impl FnMut(St
     let mut reader = BufReader::new(read);
     let mut buf = Vec::new();
     loop {
-        let reject = match read_bounded_line(&mut reader, &mut buf, MAX_LINE) {
+        let reject = match read_bounded_line(&mut reader, &mut buf, MAX_LINE_BYTES) {
             Ok(false) => return,
             Err(e) => e,
             Ok(true) => match parse_line(&buf) {
@@ -222,7 +234,7 @@ mod tests {
     #[test]
     fn overlong_line_is_refused() {
         // One byte over the limit, then a valid request: neither runs.
-        let mut input = vec![b'x'; MAX_LINE + 1];
+        let mut input = vec![b'x'; MAX_LINE_BYTES + 1];
         input.extend_from_slice(b"\n{\"method\":\"a\"}\n");
         let (r, calls) = run(&input);
         assert!(calls.is_empty(), "{calls:?}");
@@ -277,5 +289,21 @@ mod tests {
         BufReader::new(&mut extra).read_line(&mut line).unwrap();
         assert!(line.contains("too many control connections"), "{line}");
         drop(held);
+    }
+
+    #[test]
+    fn token_verification() {
+        let valid = b"{\"method\":\"test\",\"token\":\"secret123\"}";
+        assert!(matches!(parse_line_with_token(valid, Some("secret123")), Line::Request { .. }));
+
+        let wrong = b"{\"method\":\"test\",\"token\":\"wrong\"}";
+        assert!(matches!(parse_line_with_token(wrong, Some("secret123")), Line::Reject(_)));
+
+        let missing = b"{\"method\":\"test\"}";
+        assert!(matches!(parse_line_with_token(missing, Some("secret123")), Line::Reject(_)));
+
+        // Unset or empty env allows tokenless requests
+        assert!(matches!(parse_line_with_token(missing, None), Line::Request { .. }));
+        assert!(matches!(parse_line_with_token(missing, Some("")), Line::Request { .. }));
     }
 }

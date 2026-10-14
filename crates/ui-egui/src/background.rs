@@ -41,6 +41,7 @@ pub struct Job {
     pub label: String,
     /// The document the job reads (`DocState::uid`), if any.
     pub doc: Option<u64>,
+    pub handle: Option<std::thread::JoinHandle<()>>,
     then: Then,
 }
 
@@ -48,10 +49,13 @@ pub struct Job {
 #[derive(Default)]
 pub struct Background {
     worker: Option<(Sender<Task>, Receiver<Done>)>,
+    pub handle: Option<std::thread::JoinHandle<()>>,
     /// Jobs in the order they were started (the worker runs them in that order).
     pub jobs: Vec<Job>,
     next_id: u64,
 }
+
+pub type BackgroundJobs = Background;
 
 impl Background {
     /// The worker's channels, started on first use (`None` on wasm, which has no threads).
@@ -62,7 +66,7 @@ impl Background {
         if self.worker.is_none() {
             let (tx, tasks) = channel::<Task>();
             let (done_tx, done) = channel();
-            std::thread::Builder::new()
+            let handle = std::thread::Builder::new()
                 .name("vectorcraft-save".into())
                 .spawn(move || {
                     while let Ok(Task { id, work, write }) = tasks.recv() {
@@ -75,6 +79,7 @@ impl Background {
                 })
                 .ok()?;
             self.worker = Some((tx, done));
+            self.handle = Some(handle);
         }
         self.worker.as_ref().map(|(tx, _)| tx)
     }
@@ -105,7 +110,7 @@ pub fn run(
                 Ok(()) => {
                     let bg = &mut app.background;
                     bg.next_id += 1;
-                    bg.jobs.push(Job { id, label: label.clone(), doc, then: Box::new(then) });
+                    bg.jobs.push(Job { id, label: label.clone(), doc, handle: None, then: Box::new(then) });
                     let status = format!("{label}…");
                     app.status(status.clone());
                     return Ok(json!({ "background": true, "status": status }));
@@ -113,6 +118,7 @@ pub fn run(
                 // The worker stopped: start a new one next time, and do this one now.
                 Err(e) => {
                     app.background.worker = None;
+                    app.background.handle = None;
                     work = e.0.work;
                 }
             }
@@ -125,8 +131,40 @@ pub fn run(
 
 /// Apply the results that arrived (each frame).
 pub fn poll(app: &mut VectorcraftApp) {
-    while let Some(done) = app.background.worker.as_ref().and_then(|(_, rx)| rx.try_recv().ok()) {
+    let mut disconnected = false;
+    let mut done_items = Vec::new();
+    if let Some((_, rx)) = &app.background.worker {
+        loop {
+            match rx.try_recv() {
+                Ok(done) => done_items.push(done),
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+    }
+    for done in done_items {
         finish(app, done);
+    }
+    let worker_terminated = disconnected || app.background.handle.as_ref().is_some_and(|h| h.is_finished());
+    if worker_terminated && !app.background.jobs.is_empty() {
+        app.background.worker = None;
+        app.background.handle = None;
+        for job in std::mem::take(&mut app.background.jobs) {
+            apply(app, job, Err("Background worker terminated unexpectedly".into()));
+        }
+    } else {
+        let mut i = 0;
+        while i < app.background.jobs.len() {
+            if app.background.jobs.get(i).and_then(|j| j.handle.as_ref()).is_some_and(|h| h.is_finished()) {
+                let job = app.background.jobs.remove(i);
+                apply(app, job, Err("Background worker terminated unexpectedly".into()));
+            } else {
+                i += 1;
+            }
+        }
     }
 }
 
@@ -134,12 +172,13 @@ pub fn poll(app: &mut VectorcraftApp) {
 /// of a document a job is reading).
 pub fn wait_all(app: &mut VectorcraftApp) {
     while !app.background.jobs.is_empty() {
-        let Some(done) = app.background.worker.as_ref().and_then(|(_, rx)| rx.recv().ok()) else {
+        let Some(done) = app.background.worker.as_ref().and_then(|(_, rx)| rx.recv_timeout(std::time::Duration::from_secs(30)).ok()) else {
             // The worker is gone: its jobs can't finish.
             for job in std::mem::take(&mut app.background.jobs) {
-                apply(app, job, Err("the background worker stopped".into()));
+                apply(app, job, Err("Background worker terminated unexpectedly".into()));
             }
             app.background.worker = None;
+            app.background.handle = None;
             return;
         };
         finish(app, done);

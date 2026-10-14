@@ -61,91 +61,107 @@ fn is_ident(c: char) -> bool {
     c.is_alphanumeric() || c == '-' || c == '_'
 }
 
+/// Maximum number of compound steps in a selector.
+const MAX_SELECTOR_STEPS: usize = 16;
+/// Maximum ancestor traversal steps when matching selectors.
+const MAX_ANCESTOR_STEPS: usize = 64;
+
+/// `None` for selectors this cascade doesn't support (they never match).
+fn parse_selector(s: &str) -> Option<Selector> {
+    fn ident(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<String> {
+        let mut out = String::new();
+        while let Some(&c) = chars.peek().filter(|c| is_ident(**c)) {
+            out.push(c);
+            chars.next();
+        }
+        (!out.is_empty()).then_some(out)
+    }
+    // Compounds left to right; `links[i]` joins compounds i and i + 1 (true = child).
+    let mut steps: Vec<Compound> = vec![];
+    let mut links: Vec<bool> = vec![];
+    let mut cur: Option<Compound> = None;
+    let mut link: Option<bool> = None;
+    let mut chars = s.trim().chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() || c == '>' {
+            chars.next();
+            steps.extend(cur.take());
+            if steps.is_empty() || steps.len() >= MAX_SELECTOR_STEPS {
+                return None;
+            }
+            link = Some(c == '>' || link == Some(true));
+            continue;
+        }
+        let comp = match &mut cur {
+            Some(comp) => comp,
+            None => {
+                if steps.len() >= MAX_SELECTOR_STEPS {
+                    return None;
+                }
+                if !steps.is_empty() {
+                    links.push(link.take()?);
+                }
+                cur.insert(Compound::default())
+            }
+        };
+        match c {
+            '*' => {
+                chars.next();
+            }
+            '#' => {
+                chars.next();
+                comp.id = Some(ident(&mut chars)?);
+            }
+            '.' => {
+                chars.next();
+                comp.classes.push(ident(&mut chars)?);
+            }
+            '[' => {
+                chars.next();
+                let body: String = chars.by_ref().take_while(|c| *c != ']').collect();
+                let (name, value) = match body.split_once('=') {
+                    Some((n, v)) => (n.trim(), Some(v.trim().trim_matches(|c| c == '"' || c == '\'').to_string())),
+                    None => (body.trim(), None),
+                };
+                if name.is_empty() || !name.chars().all(is_ident) {
+                    return None;
+                }
+                comp.attrs.push((name.to_string(), value));
+            }
+            c if is_ident(c) => comp.tag = Some(ident(&mut chars)?),
+            _ => return None,
+        }
+    }
+    // A trailing `>` has nothing to apply to.
+    if cur.is_none() && link == Some(true) {
+        return None;
+    }
+    steps.extend(cur);
+    if steps.is_empty() || steps.len() >= MAX_SELECTOR_STEPS {
+        return None;
+    }
+    let mut specificity = (0, 0, 0);
+    for c in &steps {
+        specificity.0 += c.id.is_some() as u32;
+        specificity.1 += (c.classes.len() + c.attrs.len()) as u32;
+        specificity.2 += c.tag.is_some() as u32;
+    }
+    // Rightmost first, each with its link to the compound on its left.
+    let parts = steps.into_iter().enumerate().rev().map(|(i, c)| (c, i.checked_sub(1).and_then(|k| links.get(k)).is_some_and(|l| *l))).collect();
+    Some(Selector { parts, specificity })
+}
+
 impl Selector {
     /// `None` for selectors this cascade doesn't support (they never match).
     fn parse(s: &str) -> Option<Self> {
-        fn ident(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<String> {
-            let mut out = String::new();
-            while let Some(&c) = chars.peek().filter(|c| is_ident(**c)) {
-                out.push(c);
-                chars.next();
-            }
-            (!out.is_empty()).then_some(out)
-        }
-        // Compounds left to right; `links[i]` joins compounds i and i + 1 (true = child).
-        let mut comps: Vec<Compound> = vec![];
-        let mut links: Vec<bool> = vec![];
-        let mut cur: Option<Compound> = None;
-        let mut link: Option<bool> = None;
-        let mut chars = s.trim().chars().peekable();
-        while let Some(&c) = chars.peek() {
-            if c.is_whitespace() || c == '>' {
-                chars.next();
-                comps.extend(cur.take());
-                if comps.is_empty() {
-                    return None;
-                }
-                link = Some(c == '>' || link == Some(true));
-                continue;
-            }
-            let comp = match &mut cur {
-                Some(comp) => comp,
-                None => {
-                    if !comps.is_empty() {
-                        links.push(link.take()?);
-                    }
-                    cur.insert(Compound::default())
-                }
-            };
-            match c {
-                '*' => {
-                    chars.next();
-                }
-                '#' => {
-                    chars.next();
-                    comp.id = Some(ident(&mut chars)?);
-                }
-                '.' => {
-                    chars.next();
-                    comp.classes.push(ident(&mut chars)?);
-                }
-                '[' => {
-                    chars.next();
-                    let body: String = chars.by_ref().take_while(|c| *c != ']').collect();
-                    let (name, value) = match body.split_once('=') {
-                        Some((n, v)) => (n.trim(), Some(v.trim().trim_matches(|c| c == '"' || c == '\'').to_string())),
-                        None => (body.trim(), None),
-                    };
-                    if name.is_empty() || !name.chars().all(is_ident) {
-                        return None;
-                    }
-                    comp.attrs.push((name.to_string(), value));
-                }
-                c if is_ident(c) => comp.tag = Some(ident(&mut chars)?),
-                _ => return None,
-            }
-        }
-        // A trailing `>` has nothing to apply to.
-        if cur.is_none() && link == Some(true) {
-            return None;
-        }
-        comps.extend(cur);
-        if comps.is_empty() {
-            return None;
-        }
-        let mut specificity = (0, 0, 0);
-        for c in &comps {
-            specificity.0 += c.id.is_some() as u32;
-            specificity.1 += (c.classes.len() + c.attrs.len()) as u32;
-            specificity.2 += c.tag.is_some() as u32;
-        }
-        // Rightmost first, each with its link to the compound on its left.
-        let parts = comps.into_iter().enumerate().rev().map(|(i, c)| (c, i.checked_sub(1).and_then(|k| links.get(k)).is_some_and(|l| *l))).collect();
-        Some(Self { parts, specificity })
+        parse_selector(s)
     }
 
     fn matches(&self, n: XNode) -> bool {
-        fn go(parts: &[(Compound, bool)], n: XNode) -> bool {
+        fn matches_chain(parts: &[(Compound, bool)], n: XNode, steps: usize) -> bool {
+            if steps >= MAX_ANCESTOR_STEPS {
+                return false;
+            }
             let Some(((c, child), rest)) = parts.split_first() else { return true };
             if !c.matches(n) {
                 return false;
@@ -154,12 +170,13 @@ impl Selector {
                 return true;
             }
             if *child {
-                n.parent_element().is_some_and(|p| go(rest, p))
+                n.parent_element().is_some_and(|p| matches_chain(rest, p, steps + 1))
             } else {
-                n.ancestors().skip(1).filter(|a| a.is_element()).any(|a| go(rest, a))
+                let remaining = MAX_ANCESTOR_STEPS.saturating_sub(steps);
+                n.ancestors().skip(1).filter(|a| a.is_element()).take(remaining).any(|a| matches_chain(rest, a, steps + 1))
             }
         }
-        go(&self.parts, n)
+        matches_chain(&self.parts, n, 0)
     }
 }
 
@@ -167,6 +184,9 @@ struct Rule {
     selector: Selector,
     decls: Rc<Vec<(String, String, bool)>>,
 }
+
+/// Maximum number of rules parsed across style elements.
+const MAX_CSS_RULES: usize = 4096;
 
 /// Rules from every `<style>` element, in source order.
 fn parse_sheet(css: &str, out: &mut Vec<Rule>) {
@@ -180,6 +200,9 @@ fn parse_sheet(css: &str, out: &mut Vec<Rule>) {
     text.push_str(rest);
     let mut s = text.as_str();
     loop {
+        if out.len() >= MAX_CSS_RULES {
+            break;
+        }
         s = s.trim_start();
         if s.is_empty() {
             break;
@@ -214,6 +237,9 @@ fn parse_sheet(css: &str, out: &mut Vec<Rule>) {
         let close = s[open..].find('}').map_or(s.len(), |i| open + i);
         let decls = Rc::new(parse_decls(&s[open + 1..close]));
         for sel in head.split(',') {
+            if out.len() >= MAX_CSS_RULES {
+                break;
+            }
             if let Some(selector) = Selector::parse(sel) {
                 out.push(Rule { selector, decls: decls.clone() });
             }
@@ -352,5 +378,16 @@ mod tests {
         assert_eq!(s.specificity, (1, 1, 2));
         assert_eq!(s.parts.len(), 2);
         assert!(s.parts[0].1, "text must be a child of g");
+        // 16 or more compound steps are rejected.
+        let too_long = (0..16).map(|i| format!("g{i}")).collect::<Vec<_>>().join(" > ");
+        assert!(Selector::parse(&too_long).is_none());
+    }
+
+    #[test]
+    fn rule_limit_enforced() {
+        let mut rules = vec![];
+        let many_rules = (0..5000).map(|i| format!(".c{i} {{ fill: red }}")).collect::<Vec<_>>().join("\n");
+        parse_sheet(&many_rules, &mut rules);
+        assert_eq!(rules.len(), MAX_CSS_RULES);
     }
 }

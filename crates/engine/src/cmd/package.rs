@@ -30,11 +30,14 @@ pub fn specs() -> Vec<CommandSpec> {
 /// A file of the package: its path in the package folder (`/` separators) and bytes.
 type Entry = (String, Vec<u8>);
 
-/// `name`, else the first free `stem 2.ext`, `stem 3.ext`… (compared without case, as most
+/// `want`, else the first free `stem 2.ext`, `stem 3.ext`… (compared without case, as most
 /// desktop file systems do); the name is taken.
-fn free_name(name: &str, taken: &mut HashSet<String>) -> String {
-    let p = Path::new(name);
-    let stem = p.file_stem().map_or_else(|| name.to_string(), |s| s.to_string_lossy().into_owned());
+fn free_name(want: &str, taken: &mut HashSet<String>) -> String {
+    let clean = Path::new(want).file_name().and_then(|s| s.to_str()).unwrap_or("asset");
+    let sanitized: String = clean.chars().filter(|&c| c != '\0' && c != '/' && c != '\\').collect();
+    let sanitized = if sanitized.is_empty() || sanitized == "." || sanitized == ".." { "asset".to_string() } else { sanitized };
+    let p = Path::new(&sanitized);
+    let stem = p.file_stem().map_or_else(|| sanitized.clone(), |s| s.to_string_lossy().into_owned());
     let ext = p.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
     let out = unique_name(&stem, |s| taken.contains(&format!("{s}{ext}").to_lowercase())) + &ext;
     taken.insert(out.to_lowercase());
@@ -80,6 +83,9 @@ fn package(s: &mut Session, p: &Value) -> Result<Value> {
     let mut entries: Vec<Entry> = vec![];
     let mut taken = HashSet::new();
     let mut lines = vec![];
+
+    let doc_name = format!("{stem}.{}", vectorcraft_format::EXTENSION);
+    taken.insert(doc_name.to_lowercase());
 
     // The linked files.
     let (mut copies, mut missing) = (BTreeMap::new(), vec![]);
@@ -135,7 +141,6 @@ fn package(s: &mut Session, p: &Value) -> Result<Value> {
 
     // The document, linking to the copies.
     let mut doc = (*st.doc).clone();
-    let doc_name = format!("{stem}.{}", vectorcraft_format::EXTENSION);
     if let Some(root) = &root
         && let Some(d) = super::links::with_relative_paths(&doc, &root.join(&doc_name).to_string_lossy())
     {
@@ -153,7 +158,6 @@ fn package(s: &mut Session, p: &Value) -> Result<Value> {
         });
     }
     entries.insert(0, (doc_name.clone(), vectorcraft_format::save_file(&doc)));
-    taken.insert(doc_name.to_lowercase());
 
     // The report.
     if let Some(info) = info {
@@ -172,6 +176,9 @@ fn package(s: &mut Session, p: &Value) -> Result<Value> {
                 let path = root.join(rel);
                 if let Some(dir) = path.parent() {
                     create_dir(&dir.to_string_lossy())?;
+                }
+                if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+                    return Err(EngineError::Io("refusing to overwrite symlink in package folder".into()));
                 }
                 write_file(&path.to_string_lossy(), bytes)?;
             }

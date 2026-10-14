@@ -114,9 +114,10 @@ pub fn read(b: &mut dyn Backend, uri: &str) -> Result<Value, ReadError> {
         Some(t) => (t, variable(uri, t.uri)),
         None => return Err(ReadError::NotFound(uri.to_string())),
     };
-    if var.is_empty() {
+    let Some(var) = var else {
         return Err(ReadError::Invalid(format!("{} needs a value for `{}`", template.uri, variable_name(template.uri))));
-    }
+    };
+    let var = decode(var);
     let found = match template.name {
         "object" => read_object(b, &var).map_err(ReadError::Backend)?,
         // The command catalogue is a control method; the rest are engine commands.
@@ -138,12 +139,13 @@ fn exec(b: &mut dyn Backend, command: &str) -> Result<Value, String> {
 }
 
 /// The part of a URI between the template's `{` and its `}`.
-fn variable(uri: &str, template: &str) -> String {
-    let Some(open) = template.find('{') else { return String::new() };
-    let prefix = &template[..open];
-    let rest = uri.strip_prefix(prefix).unwrap_or("");
-    let raw = rest.split('}').next().unwrap_or("");
-    decode(raw)
+fn variable<'a>(uri: &'a str, template: &str) -> Option<&'a str> {
+    let uri = uri.split(['?', '#']).next().unwrap_or(uri);
+    let (prefix, rest_template) = template.split_once('{')?;
+    let rest = uri.strip_prefix(prefix)?;
+    let val =
+        if let Some((_, suffix)) = rest_template.split_once('}') { if !suffix.is_empty() { rest.strip_suffix(suffix)? } else { rest } } else { rest };
+    Some(val).filter(|s| !s.is_empty())
 }
 
 /// The variable's name, e.g. `id` or `name`.
@@ -206,10 +208,12 @@ mod tests {
 
     #[test]
     fn variables_are_split_out_and_decoded() {
-        assert_eq!(variable("vectorcraft://object/42", "vectorcraft://object/{id}"), "42");
-        assert_eq!(variable("vectorcraft://swatch/Brand%2040%25", "vectorcraft://swatch/{name}"), "Brand 40%");
-        assert_eq!(variable("vectorcraft://swatch/a%zzb", "vectorcraft://swatch/{name}"), "a%zzb");
-        assert_eq!(variable("vectorcraft://other", "vectorcraft://object/{id}"), "");
+        assert_eq!(variable("vectorcraft://object/42", "vectorcraft://object/{id}"), Some("42"));
+        assert_eq!(variable("vectorcraft://object/42?filter=all#frag", "vectorcraft://object/{id}"), Some("42"));
+        assert_eq!(variable("vectorcraft://swatch/Brand%2040%25", "vectorcraft://swatch/{name}"), Some("Brand%2040%25"));
+        assert_eq!(decode(variable("vectorcraft://swatch/Brand%2040%25", "vectorcraft://swatch/{name}").unwrap_or_default()), "Brand 40%");
+        assert_eq!(variable("vectorcraft://swatch/a%zzb", "vectorcraft://swatch/{name}"), Some("a%zzb"));
+        assert_eq!(variable("vectorcraft://other", "vectorcraft://object/{id}"), None);
         assert_eq!(variable_name("vectorcraft://swatch/{name}"), "name");
         assert_eq!(variable_name("no template"), "");
     }

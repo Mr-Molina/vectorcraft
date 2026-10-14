@@ -13,7 +13,10 @@ pub(super) fn batch(s: &mut Session, p: &Value) -> Result<Value> {
     let saved = (s.paint.clone(), s.fill_active, s.draw_mode, s.draw_inside, s.clipboard.clone(), s.untitled_counter);
     let (start, active): (Vec<u64>, _) = (s.docs.iter().map(|d| d.uid).collect(), s.active);
     s.batch_stash = Some(vec![]);
-    let r = run_steps(s, &label, &mut cmds);
+    let r = match crate::guard::catch_panic(std::panic::AssertUnwindSafe(|| run_steps(s, &label, &mut cmds))) {
+        Ok(r) => r,
+        Err(msg) => Err(EngineError::Internal { cmd: "command.batch".to_string(), msg }),
+    };
     let stash = s.batch_stash.take().unwrap_or_default();
     let results = match r {
         Ok(results) => results,
@@ -37,7 +40,7 @@ pub(super) fn batch(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(o) = entry.as_object_mut() {
         o.insert("commands".into(), Value::Array(cmds));
     }
-    s.journal.push(("command.batch".into(), entry));
+    s.push_journal(("command.batch".into(), entry));
     Ok(json!({ "results": results }))
 }
 

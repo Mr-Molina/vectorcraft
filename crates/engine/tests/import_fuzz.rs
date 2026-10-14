@@ -243,12 +243,54 @@ fn mutate_text(src: &str, cut: usize, edits: &[(usize, char)]) -> String {
     chars.into_iter().collect()
 }
 
+fn import_svgz(bytes: &[u8]) -> Option<Document> {
+    let text = vectorcraft_svg::text_of(bytes).ok()?;
+    vectorcraft_svg::import(&text).ok()
+}
+
 proptest! {
     #![proptest_config(config())]
 
     #[test]
     fn svg_garbage_never_panics(s in ".{0,300}") {
         survive("svg garbage", || vectorcraft_svg::import(&s).ok())?;
+    }
+
+    #[test]
+    fn fuzz_svg_import(
+        s in ".{0,300}",
+        cut in 0usize..300,
+        header_len in 0usize..10,
+    ) {
+        survive("fuzz svg import", || vectorcraft_svg::import(&s).ok())?;
+        let full = gzip(s.as_bytes());
+        let truncated = &full[..header_len.min(full.len()).min(cut)];
+        survive("fuzz svgz import truncated", || import_svgz(truncated))?;
+    }
+
+    #[test]
+    fn svgz_corrupted_gzip_and_truncated_headers_never_panic(
+        cut in 0usize..1_000,
+        flips in prop::collection::vec((0usize..1_000, any::<u8>()), 0..12),
+        header_len in 0usize..12,
+    ) {
+        let sample = gzip(rich_svg().as_bytes());
+        let mut corrupted = sample.clone();
+        for &(at, b) in &flips {
+            let n = corrupted.len();
+            if n > 0 {
+                corrupted[at % n] = b;
+            }
+        }
+        corrupted.truncate(cut.min(corrupted.len()));
+        let _ = vectorcraft_svg::is_svgz(&corrupted);
+        survive("corrupted svgz stream", || import_svgz(&corrupted))?;
+        survive("corrupted svgz load", || vectorcraft_engine::cmd::fileio::load("x.svgz", &corrupted).ok().map(|l| l.doc))?;
+
+        let truncated = &sample[..header_len.min(sample.len())];
+        let _ = vectorcraft_svg::is_svgz(truncated);
+        survive("truncated svgz header", || import_svgz(truncated))?;
+        survive("truncated svgz header load", || vectorcraft_engine::cmd::fileio::load("x.svgz", truncated).ok().map(|l| l.doc))?;
     }
 
     #[test]

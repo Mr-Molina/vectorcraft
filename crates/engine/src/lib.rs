@@ -206,6 +206,10 @@ impl DocState {
     pub fn mark_saved_as(&mut self, snapshot: &Arc<Document>) {
         self.saved_doc = snapshot.clone();
     }
+    /// A snapshot of the document as last saved (for checking if save state changed).
+    pub fn saved_snapshot(&self) -> Arc<Document> {
+        self.saved_doc.clone()
+    }
     /// Keep what interaction `it` (taken from this document) changed, as one undo step.
     pub(crate) fn keep_interaction(&mut self, it: Interaction) {
         if !Arc::ptr_eq(&it.doc, &self.doc) {
@@ -781,6 +785,8 @@ pub struct Session {
     /// While the active tool's actions run: their commands aren't "a command from outside the
     /// tool" ([`Session::after_command`]).
     pub(crate) in_tool_actions: bool,
+    /// While a live interaction preview executes its command ([`Session::preview`]).
+    pub(crate) in_preview: bool,
     /// Envelope Options with no envelope selected: the options and fidelity new envelopes get
     /// (`None`: the reference app's defaults, fidelity 50); not saved.
     pub(crate) envelope_defaults: Option<(vectorcraft_doc::live::EnvelopeOptions, f64)>,
@@ -843,6 +849,7 @@ impl Session {
             batch_stash: None,
             recovery: Default::default(),
             in_tool_actions: false,
+            in_preview: false,
             envelope_defaults: None,
             liquify_stroke: None,
             plane_widget_press: false,
@@ -854,6 +861,10 @@ impl Session {
         &self.docs
     }
     /// The open document with [`DocState::uid`] `uid` (it may have closed since it was looked up).
+    pub fn document(&self, uid: u64) -> Option<&DocState> {
+        self.docs.iter().find(|d| d.uid == uid)
+    }
+    /// The open document with [`DocState::uid`] `uid` (it may have closed since it was looked up).
     pub fn document_mut(&mut self, uid: u64) -> Option<&mut DocState> {
         self.docs.iter_mut().find(|d| d.uid == uid)
     }
@@ -862,6 +873,9 @@ impl Session {
     }
     pub fn active(&self) -> Option<&DocState> {
         self.active.and_then(|i| self.docs.get(i))
+    }
+    pub fn active_doc(&self) -> Option<&DocState> {
+        self.active()
     }
     pub fn active_mut(&mut self) -> Option<&mut DocState> {
         self.active.and_then(|i| self.docs.get_mut(i))
@@ -969,15 +983,27 @@ impl Session {
         if index >= self.docs.len() {
             return false;
         }
-        self.reset_tool_for_doc_switch();
+        let was_active = self.active == Some(index);
+        if was_active || self.docs.len() == 1 {
+            self.reset_tool_for_doc_switch();
+        }
         // Closed (saved or discarded): nothing left to recover.
-        let uid = self.docs[index].uid;
+        let uid = self.docs.get(index).map_or(0, |d| d.uid);
         cmd::recovery::forget(self, uid);
         let old = self.docs.remove(index);
         if let Some(stash) = &mut self.batch_stash {
             stash.push(old);
         }
-        self.active = if self.docs.is_empty() { None } else { Some(index.min(self.docs.len() - 1)) };
+        if self.docs.is_empty() {
+            self.active = None;
+            self.reset_tool_for_doc_switch();
+        } else if was_active {
+            self.active = Some(index.min(self.docs.len().saturating_sub(1)));
+        } else if let Some(act) = self.active
+            && index < act
+        {
+            self.active = Some(act.saturating_sub(1));
+        }
         true
     }
 
@@ -1001,7 +1027,7 @@ impl Session {
         }
         if spec.journal && self.depth == 0 && self.active().is_none_or(|d| d.interaction.is_none()) {
             let p = self.noted(params);
-            self.journal.push((id.to_string(), p));
+            self.push_journal((id.to_string(), p));
         }
         if self.depth == 0 {
             self.after_command();
@@ -1039,6 +1065,14 @@ impl Session {
         let noted = self.noted(params);
         (self.journal_note, self.note_depth) = outer;
         Ok((r?, noted))
+    }
+
+    pub(crate) fn push_journal(&mut self, entry: (String, Value)) {
+        const MAX_JOURNAL_ENTRIES: usize = 10_000;
+        if self.journal.len() >= MAX_JOURNAL_ENTRIES {
+            self.journal.drain(..1000.min(self.journal.len()));
+        }
+        self.journal.push(entry);
     }
 
     /// The journal from entry `start` on, as an action records it: without the params that only
@@ -1079,19 +1113,41 @@ impl Session {
     /// A top-level command: a panic (a bug) becomes [`EngineError::Internal`] and the active
     /// document goes back to how it was before the command, instead of crashing the frontend.
     fn run_guarded(&mut self, id: &str, f: impl FnOnce(&mut Self) -> Result<Value>) -> Result<Value> {
-        let snapshot = self.active().map(|d| (d.uid, d.doc.clone(), d.selection.clone(), d.interaction.clone()));
+        let snapshot = self.active().map(|d| {
+            (
+                d.uid,
+                d.doc.clone(),
+                d.selection.clone(),
+                d.interaction.clone(),
+                d.active_layer,
+                d.isolation,
+                d.undo_group.clone(),
+                d.layer_rows.clone(),
+                d.mask_view,
+                d.history.clone(),
+            )
+        });
         let active = self.active;
         match guard::catch_panic(|| self.run_nested(f)) {
             Ok(r) => r,
             Err(msg) => {
                 self.depth = 0;
                 self.journal_note.clear();
-                if let Some((uid, doc, selection, interaction)) = snapshot
+                self.in_tool_actions = false;
+                self.in_preview = false;
+                self.batch_stash = None;
+                if let Some((uid, doc, selection, interaction, active_layer, isolation, undo_group, layer_rows, mask_view, history)) = snapshot
                     && let Some(st) = self.docs.iter_mut().find(|d| d.uid == uid)
                 {
                     st.doc = doc;
                     st.selection = selection;
                     st.interaction = interaction;
+                    st.active_layer = active_layer;
+                    st.isolation = isolation;
+                    st.undo_group = undo_group;
+                    st.layer_rows = layer_rows;
+                    st.mask_view = mask_view;
+                    st.history = history;
                     st.revision += 1;
                 }
                 if active.is_some_and(|i| i < self.docs.len()) {
@@ -1204,11 +1260,16 @@ impl Session {
         }
         let rw = cmd::distortcmds::perspective_rewrite(self, cmd, params);
         let (cmd, params) = rw.as_ref().map_or((cmd, params), |(c, p)| (c.as_str(), p));
+        let prev_in_preview = self.in_preview;
+        self.in_preview = true;
         let r = self.execute(cmd, params);
-        let params = self.noted(params);
-        let st = self.doc_mut()?;
-        if let Some(it) = &mut st.interaction {
-            it.preview = Some((cmd.to_string(), params));
+        self.in_preview = prev_in_preview;
+        if r.is_ok() {
+            let params = self.noted(params);
+            let st = self.doc_mut()?;
+            if let Some(it) = &mut st.interaction {
+                it.preview = Some((cmd.to_string(), params));
+            }
         }
         r
     }
@@ -1231,7 +1292,7 @@ impl Session {
         if perspective_again.is_some() {
             st.last_perspective = perspective_again;
         }
-        self.journal.push(preview);
+        self.push_journal(preview);
         Ok(())
     }
 
@@ -1271,8 +1332,9 @@ impl Session {
     /// undone and dropped from the journal.
     pub fn end_undo_group(&mut self, cancel: bool) {
         let mut journal = None;
-        for st in &mut self.docs {
-            let Some(g) = st.undo_group.take() else { continue };
+        if let Some(st) = self.active_mut()
+            && let Some(g) = st.undo_group.take()
+        {
             // Only while the group's step is still the newest one.
             if cancel
                 && let Some(first) = g.first

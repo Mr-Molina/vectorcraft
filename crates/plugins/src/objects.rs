@@ -145,6 +145,9 @@ fn decode_path(v: &Value, at: &str, anchors: &mut usize) -> Result<PathData> {
 }
 
 fn unit(v: f32) -> f32 {
+    if !v.is_finite() {
+        return 0.0;
+    }
     v.clamp(0.0, 1.0)
 }
 
@@ -184,7 +187,7 @@ fn decode_paint(v: &Value, at: &str) -> Result<Paint> {
                 s.color = clamp_color(s.color);
             }
             stops.sort_by(|a, b| a.offset.total_cmp(&b.offset));
-            g.angle = g.angle.rem_euclid(360.0);
+            g.angle = if g.angle.is_finite() { g.angle.rem_euclid(360.0) } else { 0.0 };
             if let Some(geom) = &mut g.geom {
                 check_point(geom.start, at)?;
                 check_point(geom.end, at)?;
@@ -270,7 +273,10 @@ fn decode_object(v: &Value, at: &str, anchors: &mut usize) -> Result<OutObject> 
             let paint = decode_paint(s.get("paint").unwrap_or(&Value::Null), &at)?;
             let width = match opt(s, "width") {
                 None => None,
-                Some(w) => Some(w.as_f64().ok_or_else(|| out_err(&at, "`width` must be a number"))?.clamp(0.0, MAX_STROKE_WIDTH)),
+                Some(w) => {
+                    let w = w.as_f64().ok_or_else(|| out_err(&at, "`width` must be a number"))?;
+                    Some(if w.is_finite() { w.clamp(0.0, MAX_STROKE_WIDTH) } else { 1.0 })
+                }
             };
             v.push(OutStroke { paint, width });
         }
@@ -350,15 +356,12 @@ fn set_items(ap: &mut Appearance, fill: bool, new: Vec<(Paint, Option<f64>)>) {
             Some(AppearanceItem::Stroke(s)) => {
                 s.paint = paint;
                 if let Some(w) = width {
-                    s.width = w;
+                    s.width = if w.is_finite() { w.clamp(0.0, 10_000.0) } else { 1.0 };
                 }
             }
             None => {
-                let item = if fill {
-                    AppearanceItem::Fill(FillLayer::new(paint))
-                } else {
-                    AppearanceItem::Stroke(StrokeLayer::new(paint, width.unwrap_or(1.0)))
-                };
+                let w = width.map(|w| if w.is_finite() { w.clamp(0.0, 10_000.0) } else { 1.0 }).unwrap_or(1.0);
+                let item = if fill { AppearanceItem::Fill(FillLayer::new(paint)) } else { AppearanceItem::Stroke(StrokeLayer::new(paint, w)) };
                 ap.insert_item(at, item);
                 at += 1;
             }

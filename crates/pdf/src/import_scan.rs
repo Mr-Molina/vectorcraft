@@ -33,6 +33,11 @@ const MAX_TAGS: usize = 4_000_000;
 const MAX_GROUPS: usize = 10_000;
 /// The deepest layers nest in the configuration's `/Order`.
 pub(crate) const MAX_NESTING: usize = 32;
+/// The most cumulative decoded stream bytes across Form XObject recursions.
+#[cfg(target_arch = "wasm32")]
+const MAX_DECODED_BYTES: usize = 64 * 1024 * 1024;
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_DECODED_BYTES: usize = 256 * 1024 * 1024;
 
 /// An optional content group: a layer.
 #[derive(Clone, Debug, PartialEq)]
@@ -206,7 +211,39 @@ pub(crate) fn text_string(b: &[u8]) -> String {
     if let Some(rest) = b.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
         return String::from_utf8_lossy(rest).into_owned();
     }
-    b.iter().map(|&c| c as char).collect()
+    b.iter()
+        .map(|&c| match c {
+            0x80 => '\u{2022}',
+            0x81 => '\u{2020}',
+            0x82 => '\u{2021}',
+            0x83 => '\u{2026}',
+            0x84 => '\u{2014}',
+            0x85 => '\u{2013}',
+            0x86 => '\u{0192}',
+            0x87 => '\u{2044}',
+            0x88 | 0x8F => '\u{2018}',
+            0x89 | 0x90 => '\u{2019}',
+            0x8A | 0x8D => '\u{201C}',
+            0x8B | 0x8E => '\u{201D}',
+            0x8C => '\u{201E}',
+            0x91 => '\u{201A}',
+            0x92 => '\u{2122}',
+            0x93 => '\u{FB01}',
+            0x94 => '\u{FB02}',
+            0x95 => '\u{0141}',
+            0x96 => '\u{0152}',
+            0x97 => '\u{0160}',
+            0x98 => '\u{0178}',
+            0x99 => '\u{017D}',
+            0x9A => '\u{0131}',
+            0x9B => '\u{0142}',
+            0x9C => '\u{0153}',
+            0x9D => '\u{0161}',
+            0x9E => '\u{017E}',
+            0x9F => '\u{FFFD}',
+            _ => c as char,
+        })
+        .collect()
 }
 
 /// One page as the interpreter walks it.
@@ -252,6 +289,7 @@ struct Walker<'w, 'p> {
     visible: Vec<bool>,
     ops: usize,
     max_ops: usize,
+    decoded_bytes: usize,
     out: Scan,
     /// A form XObject hidden by its own optional content was met.
     hidden_form: bool,
@@ -305,7 +343,7 @@ impl Walker<'_, '_> {
         self.note_fonts(res);
         while let Some(op) = iter.next() {
             self.ops += 1;
-            if self.ops > self.max_ops || self.out.tags.len() >= MAX_TAGS {
+            if self.ops > self.max_ops || self.out.tags.len() >= MAX_TAGS || self.decoded_bytes > MAX_DECODED_BYTES {
                 self.out.cut = true;
                 return;
             }
@@ -348,6 +386,11 @@ impl Walker<'_, '_> {
                         continue;
                     }
                     let Ok(data) = s.decoded() else { continue };
+                    self.decoded_bytes = self.decoded_bytes.saturating_add(data.as_ref().len());
+                    if self.decoded_bytes > MAX_DECODED_BYTES {
+                        self.out.cut = true;
+                        return;
+                    }
                     let oc = d.get::<Dict<'_>>(b"OC");
                     if let Some(oc) = &oc {
                         self.begin_oc(oc, d.get_ref(b"OC").map(ObjectIdentifier::from));
@@ -380,7 +423,18 @@ pub(crate) fn scan_page(page: &Page<'_>, ocgs: &mut Ocgs, all_on: bool, fonts: &
 
 fn walk_page<'w, 'p>(page: &Page<'p>, ocgs: &'w mut Ocgs, all_on: bool, fonts: &'w mut HashMap<u128, String>) -> Walker<'w, 'p> {
     let off = if all_on { HashSet::new() } else { ocgs.off.clone() };
-    let mut w = Walker { ocgs, off, xref: page.xref(), fonts, visible: vec![], ops: 0, max_ops: max_ops(), out: Scan::default(), hidden_form: false };
+    let mut w = Walker {
+        ocgs,
+        off,
+        xref: page.xref(),
+        fonts,
+        visible: vec![],
+        ops: 0,
+        max_ops: max_ops(),
+        decoded_bytes: 0,
+        out: Scan::default(),
+        hidden_form: false,
+    };
     w.walk(page.typed_operations(), page.resources(), 0);
     w
 }

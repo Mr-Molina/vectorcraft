@@ -3586,6 +3586,12 @@ axis	Both	Ambos
 @msg	{tool} isn't in a toolbar group of several tools	{tool} no está en un grupo de la barra de herramientas con varias herramientas
 @msg	onto must name a panel floating in another group	onto debe nombrar un panel que flote en otro grupo
 @msg	x and y must both be numbers	x e y deben ser números
+@msg	Background worker terminated unexpectedly	El subproceso de trabajo en segundo plano finalizó inesperadamente
+@msg	linked file exceeds maximum size	el archivo vinculado supera el tamaño máximo
+@msg	path cannot be empty	la ruta no puede estar vacía
+@msg	path contains null byte	la ruta contiene un byte nulo
+@msg	path traversal ('..') is not permitted	no se permite el recorrido de rutas ('..')
+@msg	the file's embedded data exceeds {_1} MB	los datos incrustados del archivo superan {_1} MB
 
 # The macOS menu bar (native_menu): the app and Window menus' system items, Settings pages.
 	Services	Servicios

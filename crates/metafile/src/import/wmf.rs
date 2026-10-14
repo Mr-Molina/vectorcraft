@@ -71,19 +71,31 @@ fn header(bytes: &[u8]) -> Option<(usize, Option<(Rect, f64)>)> {
     if words < 9 {
         return None;
     }
-    Some((start + words * 2, placeable))
+    Some((start.checked_add(words.checked_mul(2)?)?, placeable))
 }
 
 /// The first window origin and extent, as the picture's box when there is no placeable header.
 fn window(bytes: &[u8], mut at: usize) -> Option<Rect> {
     let (mut org, mut ext) = (None, None);
-    while let Some(head) = bytes.get(at..at + 6) {
-        let words = u32::from_le_bytes([head[0], head[1], head[2], head[3]]) as usize;
-        let function = u16::from_le_bytes([head[4], head[5]]);
+    while let Some(hdr_end) = at.checked_add(6) {
+        if hdr_end > bytes.len() {
+            break;
+        }
+        let Some(head) = bytes.get(at..hdr_end) else {
+            break;
+        };
+        let Some(words_bytes) = head.get(..4).and_then(|b| b.try_into().ok()) else {
+            break;
+        };
+        let words = u32::from_le_bytes(words_bytes) as usize;
+        let Some(func_bytes) = head.get(4..6).and_then(|b| b.try_into().ok()) else {
+            break;
+        };
+        let function = u16::from_le_bytes(func_bytes);
         if words < 3 || function == 0 {
             break;
         }
-        let mut r = Reader::new(bytes.get(at + 6..).unwrap_or_default());
+        let mut r = Reader::new(bytes.get(hdr_end..).unwrap_or_default());
         match function {
             0x020B if org.is_none() => org = point_yx(&mut r),
             0x020C if ext.is_none() => ext = point_yx(&mut r),
@@ -92,7 +104,13 @@ fn window(bytes: &[u8], mut at: usize) -> Option<Rect> {
         if org.is_some() && ext.is_some() {
             break;
         }
-        at = at.saturating_add(words.saturating_mul(2));
+        let Some(len) = words.checked_mul(2) else {
+            break;
+        };
+        let Some(end) = at.checked_add(len) else {
+            break;
+        };
+        at = end;
     }
     let o = org.unwrap_or(Point::ZERO);
     let e = ext?;
@@ -111,21 +129,44 @@ pub(super) fn play(bytes: &[u8]) -> Result<Imported, String> {
     let mut p = Player::new(Kind::Wmf, Affine::scale(k) * Affine::translate(-origin.to_vec2()), 25.4 / inch, artboard);
     let mut at = start;
     let mut ended = false;
-    while let Some(head) = bytes.get(at..at + 6) {
-        let words = u32::from_le_bytes([head[0], head[1], head[2], head[3]]) as usize;
-        let function = u16::from_le_bytes([head[4], head[5]]);
+    while let Some(hdr_end) = at.checked_add(6) {
+        if hdr_end > bytes.len() {
+            break;
+        }
+        let Some(head) = bytes.get(at..hdr_end) else {
+            break;
+        };
+        let Some(words_bytes) = head.get(..4).and_then(|b| b.try_into().ok()) else {
+            break;
+        };
+        let words = u32::from_le_bytes(words_bytes) as usize;
+        let Some(func_bytes) = head.get(4..6).and_then(|b| b.try_into().ok()) else {
+            break;
+        };
+        let function = u16::from_le_bytes(func_bytes);
         if function == 0 {
             ended = true;
             break;
         }
-        let Some(rec) = words.checked_mul(2).and_then(|n| bytes.get(at..at.checked_add(n)?)).filter(|_| words >= 3) else { break };
+        let Some(len) = words.checked_mul(2) else {
+            break;
+        };
+        let Some(end) = at.checked_add(len) else {
+            break;
+        };
+        if words < 3 || end > bytes.len() {
+            break;
+        }
+        let Some(rec) = bytes.get(at..end) else {
+            break;
+        };
         if !matches!(function, 0x0213 | 0x0214) {
             p.flush();
         }
         if record(&mut p, function, rec.get(6..).unwrap_or_default()).is_none() {
             p.skip();
         }
-        at += rec.len();
+        at = end;
     }
     if !ended {
         p.warn("the file ends early: what it held was imported");
@@ -148,7 +189,14 @@ fn blit(p: &mut Player, rop: u32, src: (i16, i16, i16, i16), dest: (i16, i16, i1
     let Some(packed) = packed else { return p.pattern_blit(d, rop) };
     let parts = dib::split(packed);
     let img = parts.ok_or_else(|| "damaged".to_string()).and_then(|(bmi, bits)| dib::decode(bmi, bits, Alpha::Ignore));
-    let bottom_up = parts.and_then(|(bmi, _)| bmi.get(8..12)).is_some_and(|h| i32::from_le_bytes([h[0], h[1], h[2], h[3]]) > 0);
+    let bottom_up = parts.is_none_or(|(bmi, _)| {
+        let size = bmi.get(..4).and_then(|b| b.try_into().ok()).map(u32::from_le_bytes);
+        match size {
+            Some(12) => true,
+            Some(s) if s >= 40 => bmi.get(8..12).and_then(|h| h.try_into().ok()).map(i32::from_le_bytes).is_none_or(|h| h > 0),
+            _ => true,
+        }
+    });
     let ih = img.as_ref().map_or(0.0, |i| f64::from(i.height));
     let (xs, ys, ws, hs) = (f64::from(src.0), f64::from(src.1), f64::from(src.2), f64::from(src.3));
     let top = if bottom_up { ih - ys - hs } else { ys };

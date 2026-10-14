@@ -1,0 +1,171 @@
+commit bf7a4271f50ff6f79a7169d80da9559bb6014469
+Author: Mr. Molina <jose.angel.molina.agosto@gmail.com>
+Date:   Mon Oct 12 16:53:26 2026 -0400
+
+    feat(mcp): wire semantic_summary, cluster_colors, and render_overlay tools
+
+diff --git a/crates/engine/src/cmd/docmenu.rs b/crates/engine/src/cmd/docmenu.rs
+index 1623ebc..d52f961 100644
+--- a/crates/engine/src/cmd/docmenu.rs
++++ b/crates/engine/src/cmd/docmenu.rs
+@@ -851,4 +851,3 @@ pub(crate) fn render_overlay(s: &mut Session, p: &Value) -> Result<Value> {
+         }
+     }))
+ }
+-
+diff --git a/crates/engine/src/inspect.rs b/crates/engine/src/inspect.rs
+index 649ee01..c964424 100644
+--- a/crates/engine/src/inspect.rs
++++ b/crates/engine/src/inspect.rs
+@@ -301,16 +301,12 @@ pub fn semantic_summary(s: &Session, p: &Value) -> Result<Value, crate::EngineEr
+         }
+     }
+ 
+-    let palette: Vec<Value> = palette_map
+-        .into_iter()
+-        .take(max_palette)
+-        .map(|(hex, (count, ids))| {
+-            json!({ "hex": hex, "count": count, "sample_node_ids": ids })
+-        })
+-        .collect();
++    let palette: Vec<Value> =
++        palette_map.into_iter().take(max_palette).map(|(hex, (count, ids))| json!({ "hex": hex, "count": count, "sample_node_ids": ids })).collect();
+ 
+     Ok(json!({
+         "artboard": artboard_rect.map(|r| json!({"width": r.width(), "height": r.height()})).unwrap_or(Value::Null),
++        "artboard_count": doc.artboards.len(),
+         "background_card_id": bg_card_id,
+         "total_nodes": total_nodes,
+         "group_count": group_count,
+@@ -318,4 +314,3 @@ pub fn semantic_summary(s: &Session, p: &Value) -> Result<Value, crate::EngineEr
+         "palette": palette
+     }))
+ }
+-
+diff --git a/crates/mcp/src/tests_protocol.rs b/crates/mcp/src/tests_protocol.rs
+index 40d656a..b8693a2 100644
+--- a/crates/mcp/src/tests_protocol.rs
++++ b/crates/mcp/src/tests_protocol.rs
+@@ -3,7 +3,7 @@
+ 
+ use serde_json::{Value, json};
+ 
+-use crate::{Headless, PROMPTS, Server};
++use crate::{Headless, PROMPTS, Server, tool_definitions};
+ 
+ fn server() -> Server {
+     Server::new(Box::new(Headless::with_document()))
+@@ -217,3 +217,50 @@ fn log_records_go_out_as_notifications_once_asked_for() {
+     assert!(lines[last_reply + 1..].iter().all(|l| l.get("id").is_none()), "{lines:?}");
+     result(&mut s, 4, "logging/setLevel", json!({"level": null}));
+ }
++
++// ---------- agent extensions ----------
++
++#[test]
++fn test_mcp_tools_include_agent_extensions() {
++    let defs = tool_definitions();
++    let names: Vec<&str> = defs.iter().filter_map(|t| t["name"].as_str()).collect();
++    assert!(names.contains(&"semantic_summary"), "missing semantic_summary in {names:?}");
++    assert!(names.contains(&"cluster_colors"), "missing cluster_colors in {names:?}");
++    assert!(names.contains(&"render_overlay"), "missing render_overlay in {names:?}");
++}
++
++#[test]
++fn test_mcp_semantic_summary_tool_call() {
++    let mut s = server();
++    let r = result(&mut s, 1, "tools/call", json!({"name": "semantic_summary", "arguments": {}}));
++    assert_eq!(r["isError"], false, "{r}");
++    let text = r["content"][0]["text"].as_str().expect("text content");
++    let val: Value = serde_json::from_str(text).expect("valid JSON response");
++    assert!(val.get("group_count").is_some(), "missing group_count: {val}");
++    assert!(val.get("loose_path_count").is_some(), "missing loose_path_count: {val}");
++    assert!(val.get("artboard_count").is_some(), "missing artboard_count: {val}");
++}
++
++#[test]
++fn test_mcp_cluster_colors_tool_call() {
++    let mut s = server();
++    rectangle(&mut s, 1);
++    tool(&mut s, 2, "draw_shape", json!({"shape": "ellipse", "x": 100, "y": 100, "width": 50, "height": 50}));
++    let r = result(&mut s, 3, "tools/call", json!({"name": "cluster_colors", "arguments": {"max_delta_e": 10.0, "action": "preview"}}));
++    assert_eq!(r["isError"], false, "{r}");
++    let text = r["content"][0]["text"].as_str().expect("text content");
++    let val: Value = serde_json::from_str(text).expect("valid JSON response");
++    assert!(val.get("clusters").and_then(Value::as_array).is_some(), "missing clusters array: {val}");
++}
++
++#[test]
++fn test_mcp_render_overlay_tool_call() {
++    let mut s = server();
++    rectangle(&mut s, 1);
++    let tmp_path = std::env::temp_dir().join(format!("test_mcp_render_overlay_{}.png", std::process::id()));
++    let tmp_str = tmp_path.to_str().expect("valid path string").to_string();
++    let r = result(&mut s, 2, "tools/call", json!({"name": "render_overlay", "arguments": {"path": tmp_str}}));
++    assert_eq!(r["isError"], false, "{r}");
++    assert!(tmp_path.exists(), "overlay image was not created at {:?}", tmp_path);
++    let _ = std::fs::remove_file(&tmp_path);
++}
+diff --git a/crates/mcp/src/tools.rs b/crates/mcp/src/tools.rs
+index ce0f8e8..7ae0a06 100644
+--- a/crates/mcp/src/tools.rs
++++ b/crates/mcp/src/tools.rs
+@@ -405,6 +405,48 @@ pub fn tool_definitions() -> Vec<Value> {
+         ),
+         tool("undo", "Undo", "Undo the last change (Edit → Undo).", empty(), false),
+         tool("redo", "Redo", "Redo the last undone change (Edit → Redo).", empty(), false),
++        tool(
++            "semantic_summary",
++            "Get Semantic Document Summary",
++            "Returns a token-efficient summary of the active document: artboards, canvas background card ID, total group and loose path counts, and dominant palette frequency.",
++            obj(
++                json!({
++                    "selection_only": {"type": "boolean", "description": "Only summarize selected nodes"},
++                    "max_palette_entries": {"type": "integer", "description": "Maximum color swatches (default 32)"},
++                }),
++                &[],
++            ),
++            true,
++        ),
++        tool(
++            "cluster_colors",
++            "Cluster Nodes by Perceptual Color",
++            "Groups or previews nodes clustered by perceptual color distance (CIEDE2000). Action 'preview' returns proposed groups. Action 'group' creates new named color groups atomically.",
++            obj(
++                json!({
++                    "node_ids": {"type": "array", "items": {"type": "integer"}, "description": "Node IDs to cluster"},
++                    "max_delta_e": num("Perceptual color distance threshold (CIEDE2000)"),
++                    "action": {"type": "string", "enum": ["preview", "group"], "description": "Execution action ('preview' or 'group')"},
++                }),
++                &["max_delta_e", "action"],
++            ),
++            false,
++        ),
++        tool(
++            "render_overlay",
++            "Render Labeled Visual Overlay",
++            "Exports an annotated PNG image of the artboard displaying semi-transparent bounding boxes and high-contrast numbered badges for nodes.",
++            obj(
++                json!({
++                    "path": string("Target PNG file path"),
++                    "scale": num("Raster scale factor (default 2.0)"),
++                    "node_ids": {"type": "array", "items": {"type": "integer"}, "description": "Node IDs to label"},
++                    "ungrouped_only": {"type": "boolean", "description": "Only label ungrouped paths"},
++                }),
++                &["path"],
++            ),
++            true,
++        ),
+     ]
+ }
+ 
+@@ -813,6 +855,9 @@ fn dispatch(b: &mut dyn Backend, name: &str, a: &Args) -> Result<ToolResult, Str
+         }
+         "undo" => j(exec(b, "edit.undo", json!({}))?),
+         "redo" => j(exec(b, "edit.redo", json!({}))?),
++        "semantic_summary" => j(exec(b, "document.semantic_summary", Value::Object(a.clone()))?),
++        "cluster_colors" => j(exec(b, "color.cluster", Value::Object(a.clone()))?),
++        "render_overlay" => j(exec(b, "render.overlay", Value::Object(a.clone()))?),
+         other => Err(format!("unknown tool `{other}` (see tools/list)")),
+     }
+ }

@@ -43,7 +43,7 @@ use serde::{Deserialize, Serialize};
 use vectorcraft_doc::{Document, ImageBlob};
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use atomic::{write_atomic, write_atomic_with};
+pub use atomic::{TempGuard, open_temp, resolve_target, write_atomic, write_atomic_with};
 
 /// v4: large data after the JSON (v1 to v3 files still load).
 pub const VERSION: u32 = 4;
@@ -61,7 +61,16 @@ pub const EXTENSION: &str = "vectorcraft";
 /// Extension and format name from before the project was renamed (DrawCraft): still opened.
 pub const LEGACY_EXTENSION: &str = "drawcraft";
 /// Most bytes a compressed file may unpack to (a guard against decompression bombs).
+#[cfg(not(target_arch = "wasm32"))]
 const MAX_UNPACKED: u64 = 512 << 20;
+#[cfg(target_arch = "wasm32")]
+const MAX_UNPACKED: u64 = 128 << 20;
+
+/// Maximum cumulative decoded bytes allowed across embedded images and color profiles.
+#[cfg(not(target_arch = "wasm32"))]
+pub const MAX_TOTAL_EMBEDDED_BYTES: usize = 512 * 1024 * 1024;
+#[cfg(target_arch = "wasm32")]
+pub const MAX_TOTAL_EMBEDDED_BYTES: usize = 128 * 1024 * 1024;
 
 /// Is `ext` (without the dot, any case) a native document extension?
 pub fn is_native_ext(ext: &str) -> bool {
@@ -87,6 +96,8 @@ pub enum FormatError {
     CompressedTooOld(u32),
     #[error("the compressed file unpacks to more than {} MB", MAX_UNPACKED >> 20)]
     TooBig,
+    #[error("the file's embedded data exceeds {} MB", MAX_TOTAL_EMBEDDED_BYTES >> 20)]
+    TooLarge,
     #[error("can't encode the document: {0}")]
     Encode(String),
 }
@@ -442,8 +453,13 @@ pub fn load_file(bytes: &[u8]) -> Result<NativeFile, FormatError> {
         return Err(FormatError::TooNew(f.version));
     }
     let mut doc = f.document;
+    let mut total_decoded_bytes: usize = 0;
     for (k, img) in f.images {
         let bytes = img.bytes(tail).ok_or_else(|| FormatError::BadImage(k.clone()))?;
+        total_decoded_bytes = total_decoded_bytes.saturating_add(bytes.len());
+        if total_decoded_bytes > MAX_TOTAL_EMBEDDED_BYTES {
+            return Err(FormatError::TooLarge);
+        }
         let mut blob = ImageBlob::new(img.mime, bytes);
         // Until the linked file is read, the preview stands in for it.
         if img.proxy {
@@ -460,7 +476,16 @@ pub fn load_file(bytes: &[u8]) -> Result<NativeFile, FormatError> {
     doc.fix_next_id();
     // Untrusted: capped, named and pointing at objects the file has.
     doc.tidy_saved_selections();
-    let profiles = f.profiles.into_iter().filter_map(|(name, icc)| Some((name, icc.bytes(tail)?))).collect();
+    let mut profiles = BTreeMap::new();
+    for (name, icc) in f.profiles {
+        if let Some(icc_bytes) = icc.bytes(tail) {
+            total_decoded_bytes = total_decoded_bytes.saturating_add(icc_bytes.len());
+            if total_decoded_bytes > MAX_TOTAL_EMBEDDED_BYTES {
+                return Err(FormatError::TooLarge);
+            }
+            profiles.insert(name, icc_bytes);
+        }
+    }
     Ok(NativeFile { doc, info: FileInfo { version: f.version, legacy: f.format == LEGACY_EXTENSION }, profiles })
 }
 
@@ -527,23 +552,33 @@ pub fn base64_decode(s: &str) -> Option<Vec<u8>> {
     if !clean.len().is_multiple_of(4) {
         return None;
     }
+    if clean.is_empty() {
+        return Some(Vec::new());
+    }
+    let pad = clean.iter().rev().take_while(|&&b| b == b'=').count();
+    if pad > 2 {
+        return None;
+    }
+    let data_len = clean.len() - pad;
+    if clean.get(..data_len)?.contains(&b'=') {
+        return None;
+    }
     let mut out = Vec::with_capacity(clean.len() / 4 * 3);
-    for c in clean.chunks(4) {
+    for (i, c) in clean.as_chunks::<4>().0.iter().enumerate() {
+        let is_last = (i + 1) * 4 == clean.len();
+        let chunk_pad = if is_last { pad } else { 0 };
         let mut n = 0u32;
-        let mut pad = 0;
         for &b in c {
             n <<= 6;
-            if b == b'=' {
-                pad += 1;
-            } else {
+            if b != b'=' {
                 n |= val(b)?;
             }
         }
         out.push((n >> 16) as u8);
-        if pad < 2 {
+        if chunk_pad < 2 {
             out.push((n >> 8) as u8);
         }
-        if pad < 1 {
+        if chunk_pad < 1 {
             out.push(n as u8);
         }
     }
@@ -615,5 +650,29 @@ mod tests {
             assert_eq!(base64_decode(&base64_encode(s)).unwrap(), s);
         }
         assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn base64_strict_padding_and_alignment() {
+        // Not divisible by 4
+        assert_eq!(base64_decode("abc"), None);
+        assert_eq!(base64_decode("a"), None);
+        assert_eq!(base64_decode("abcde"), None);
+
+        // pad > 2
+        assert_eq!(base64_decode("A==="), None);
+        assert_eq!(base64_decode("===="), None);
+
+        // '=' appearing before final pad bytes
+        assert_eq!(base64_decode("A=AA"), None);
+        assert_eq!(base64_decode("=AAA"), None);
+        assert_eq!(base64_decode("Zm=v"), None);
+        assert_eq!(base64_decode("Zm==Zm9v"), None);
+        assert_eq!(base64_decode("=A=="), None);
+
+        // Valid padding
+        assert_eq!(base64_decode("Zg=="), Some(b"f".to_vec()));
+        assert_eq!(base64_decode("Zm8="), Some(b"fo".to_vec()));
+        assert_eq!(base64_decode("Zm9v"), Some(b"foo".to_vec()));
     }
 }

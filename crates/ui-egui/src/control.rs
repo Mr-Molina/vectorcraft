@@ -63,6 +63,23 @@ fn wrap(r: Result<Value, String>) -> Outcome {
     }
 }
 
+/// Validate a file path received over the control protocol.
+///
+/// Rejects empty or whitespace-only paths, null bytes (`'\0'`), and path traversal (`..`).
+pub fn sanitize_control_path(raw: &str) -> Result<&str, String> {
+    if raw.trim().is_empty() {
+        return Err("path cannot be empty".to_string());
+    }
+    if raw.contains('\0') {
+        return Err("path contains null byte".to_string());
+    }
+    let path = std::path::Path::new(raw);
+    if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return Err("path traversal ('..') is not permitted".to_string());
+    }
+    Ok(raw)
+}
+
 pub fn all_commands(app: &VectorcraftApp) -> Value {
     let mut v: Vec<Value> = app.session.commands().into_iter().map(|c| serde_json::to_value(c).unwrap_or_default()).collect();
     for (id, label, sc, params) in crate::menus::UI_COMMANDS {
@@ -152,8 +169,8 @@ pub fn handle(app: &mut VectorcraftApp, ctx: &egui::Context, req: &ControlReques
                     "doubleclick" | "dblclick" => PointerKind::DoubleClick,
                     other => return err(format!("unknown pointer kind `{other}`")),
                 };
-                let x = e.get("x").and_then(Value::as_f64).unwrap_or(0.0);
-                let y = e.get("y").and_then(Value::as_f64).unwrap_or(0.0);
+                let x = e.get("x").and_then(Value::as_f64).filter(|f| f.is_finite()).unwrap_or(0.0);
+                let y = e.get("y").and_then(Value::as_f64).filter(|f| f.is_finite()).unwrap_or(0.0);
                 let pos = if e.get("space").and_then(Value::as_str) == Some("screen") {
                     match xf {
                         Some(xf) => xf.to_doc(egui::pos2(x as f32, y as f32)),
@@ -186,14 +203,16 @@ pub fn handle(app: &mut VectorcraftApp, ctx: &egui::Context, req: &ControlReques
             ok(Value::Null)
         }
         "ui.move" => {
-            let pos = egui::pos2(p.get("x").and_then(Value::as_f64).unwrap_or(0.0) as f32, p.get("y").and_then(Value::as_f64).unwrap_or(0.0) as f32);
+            let x = p.get("x").and_then(Value::as_f64).filter(|f| f.is_finite()).unwrap_or(0.0) as f32;
+            let y = p.get("y").and_then(Value::as_f64).filter(|f| f.is_finite()).unwrap_or(0.0) as f32;
+            let pos = egui::pos2(x, y);
             app.synthetic.push(egui::Event::PointerMoved(pos));
             ctx.request_repaint();
             ok(Value::Null)
         }
         "ui.click" | "ui.drag" => {
             // Screen-space (egui points) pointer input through egui itself: reaches every widget.
-            let f = |k: &str| p.get(k).and_then(Value::as_f64).unwrap_or(0.0) as f32;
+            let f = |k: &str| p.get(k).and_then(Value::as_f64).filter(|f| f.is_finite()).unwrap_or(0.0) as f32;
             let button = match s("button") {
                 Some("right") | Some("secondary") => egui::PointerButton::Secondary,
                 _ => egui::PointerButton::Primary,
@@ -204,14 +223,14 @@ pub fn handle(app: &mut VectorcraftApp, ctx: &egui::Context, req: &ControlReques
             app.synthetic.push(egui::Event::PointerMoved(a));
             app.synthetic.push(egui::Event::PointerButton { pos: a, button, pressed: true, modifiers });
             if req.method == "ui.drag" {
-                let steps = p.get("steps").and_then(Value::as_u64).unwrap_or(8).max(1);
+                let steps = p.get("steps").and_then(Value::as_u64).unwrap_or(8).clamp(1, 1000);
                 for i in 1..=steps {
                     let t = i as f32 / steps as f32;
                     app.synthetic.push(egui::Event::PointerMoved(a + (end - a) * t));
                 }
             }
             app.synthetic.push(egui::Event::PointerButton { pos: end, button, pressed: false, modifiers });
-            let count = p.get("count").and_then(Value::as_u64).unwrap_or(1);
+            let count = p.get("count").and_then(Value::as_u64).unwrap_or(1).clamp(1, 100);
             for _ in 1..count {
                 app.synthetic.push(egui::Event::PointerButton { pos: end, button, pressed: true, modifiers });
                 app.synthetic.push(egui::Event::PointerButton { pos: end, button, pressed: false, modifiers });
@@ -222,7 +241,7 @@ pub fn handle(app: &mut VectorcraftApp, ctx: &egui::Context, req: &ControlReques
         "ui.wheel" => {
             // Mouse wheel notches over screen point (x, y): `dy` up (+) or down, `dx` sideways
             // (`unit: "point"` for trackpad-like points), with modifiers as `ui.click` takes them.
-            let f = |k: &str| p.get(k).and_then(Value::as_f64).unwrap_or(0.0) as f32;
+            let f = |k: &str| p.get(k).and_then(Value::as_f64).filter(|f| f.is_finite()).unwrap_or(0.0) as f32;
             let unit = if s("unit") == Some("point") { egui::MouseWheelUnit::Point } else { egui::MouseWheelUnit::Line };
             // Notches, not a flood: a turn stays within what a real wheel sends.
             let delta = egui::vec2(f("dx"), f("dy")).clamp(egui::Vec2::splat(-100.0), egui::Vec2::splat(100.0));
@@ -237,12 +256,17 @@ pub fn handle(app: &mut VectorcraftApp, ctx: &egui::Context, req: &ControlReques
             ok(Value::Null)
         }
         "ui.set" => {
-            let mut r = Ok(Value::Null);
             if let Some(b) = s("brightness") {
-                r = app.run("window.brightness", json!({"brightness": b}));
+                let r = app.run("window.brightness", json!({"brightness": b}));
+                if r.is_err() {
+                    return wrap(r);
+                }
             }
             if let Some(pn) = s("panel") {
-                r = app.run("window.panel", json!({"panel": pn}));
+                let r = app.run("window.panel", json!({"panel": pn}));
+                if r.is_err() {
+                    return wrap(r);
+                }
             }
             if let Some(st) = s("status") {
                 app.ui.status = st.to_string();
@@ -263,7 +287,10 @@ pub fn handle(app: &mut VectorcraftApp, ctx: &egui::Context, req: &ControlReques
                         _ => app.ui.view.bounding_box,
                     };
                     if cur != want {
-                        r = app.run(flag, json!({}));
+                        let r = app.run(flag, json!({}));
+                        if r.is_err() {
+                            return wrap(r);
+                        }
                     }
                 }
             }
@@ -273,7 +300,7 @@ pub fn handle(app: &mut VectorcraftApp, ctx: &egui::Context, req: &ControlReques
             if p.get("closePanel").is_some() {
                 app.ui.open_panel = None;
             }
-            wrap(r)
+            ok(Value::Null)
         }
         "ui.dialog.set" => match app.ui.dialog.as_mut() {
             Some(d) => {
@@ -289,8 +316,8 @@ pub fn handle(app: &mut VectorcraftApp, ctx: &egui::Context, req: &ControlReques
             ok(Value::Null)
         }
         "ui.resize" => {
-            let w = p.get("width").and_then(Value::as_f64).unwrap_or(1440.0) as f32;
-            let h = p.get("height").and_then(Value::as_f64).unwrap_or(900.0) as f32;
+            let w = (p.get("width").and_then(Value::as_f64).filter(|f| f.is_finite()).unwrap_or(1440.0) as f32).clamp(100.0, 16384.0);
+            let h = (p.get("height").and_then(Value::as_f64).filter(|f| f.is_finite()).unwrap_or(900.0) as f32).clamp(100.0, 16384.0);
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w, h)));
             ok(Value::Null)
         }
@@ -299,17 +326,24 @@ pub fn handle(app: &mut VectorcraftApp, ctx: &egui::Context, req: &ControlReques
             ok(Value::Null)
         }
         "ui.screenshot" => {
+            let path = match s("path") {
+                Some(p) => match sanitize_control_path(p) {
+                    Ok(clean) => Some(clean.to_string()),
+                    Err(e) => return err(e),
+                },
+                None => None,
+            };
             if p.get("focus").and_then(Value::as_bool).unwrap_or(true) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
             ctx.request_repaint();
-            Outcome::Screenshot { path: s("path").map(str::to_string) }
+            Outcome::Screenshot { path }
         }
         "ui.render" => {
             let Some(st) = app.session.active() else { return err("no document") };
             let doc = st.doc.clone();
             let Some(r) = doc.artboards.first().map(|a| a.rect) else { return err("no artboard") };
-            let scale = p.get("scale").and_then(Value::as_f64).unwrap_or(1.0);
+            let scale = p.get("scale").and_then(Value::as_f64).filter(|f| f.is_finite()).unwrap_or(1.0);
             if let Err(e) = vectorcraft_render::raster_size(r, scale) {
                 return err(e);
             }
@@ -319,17 +353,29 @@ pub fn handle(app: &mut VectorcraftApp, ctx: &egui::Context, req: &ControlReques
                 Err(e) => return err(e),
             };
             match s("path") {
-                Some(path) => match app.services.write.as_mut() {
-                    Some(w) => wrap(w(path, &png).map(|_| json!({"path": path, "width": img.width, "height": img.height}))),
-                    None => err("no writer"),
-                },
+                Some(path) => {
+                    let path = match sanitize_control_path(path) {
+                        Ok(p) => p,
+                        Err(e) => return err(e),
+                    };
+                    match app.services.write.as_mut() {
+                        Some(w) => wrap(w(path, &png).map(|_| json!({"path": path, "width": img.width, "height": img.height}))),
+                        None => err("no writer"),
+                    }
+                }
                 None => ok(json!({"width": img.width, "height": img.height, "pngBase64": vectorcraft_format::base64_encode(&png)})),
             }
         }
         "app.open" => wrap(app.run("file.open", json!({"path": s("path")}))),
         "app.save" => wrap(app.run("file.save", if p.is_object() { p.clone() } else { json!({}) })),
         "app.export" => match s("path") {
-            Some(path) => wrap(crate::io::export(app, s("format"), Some(path.to_string()), p)),
+            Some(path) => {
+                let path = match sanitize_control_path(path) {
+                    Ok(p) => p,
+                    Err(e) => return err(e),
+                };
+                wrap(crate::io::export(app, s("format"), Some(path.to_string()), p))
+            }
             // No save dialog for an agent: the bytes come back, as in headless mode.
             None => wrap(app.run("document.export", p.clone())),
         },
@@ -346,6 +392,9 @@ pub fn save_screenshot(app: &mut VectorcraftApp, image: &egui::ColorImage, path:
     let Some(path) = path else {
         return json!({"ok": true, "result": {"width": w, "height": h}});
     };
+    if let Err(e) = sanitize_control_path(path) {
+        return json!({"ok": false, "error": e});
+    }
     let rgba: Vec<u8> = image.pixels.iter().flat_map(|c| c.to_array()).collect();
     let img = vectorcraft_render::Rendered { width: w as u32, height: h as u32, pixels: rgba };
     let png = match img.to_png() {
@@ -358,5 +407,34 @@ pub fn save_screenshot(app: &mut VectorcraftApp, image: &egui::ColorImage, path:
             Err(e) => json!({"ok": false, "error": e}),
         },
         None => json!({"ok": false, "error": "no writer configured"}),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_control_path_rejects_empty_and_whitespace() {
+        assert!(sanitize_control_path("").is_err());
+        assert!(sanitize_control_path("   ").is_err());
+    }
+
+    #[test]
+    fn sanitize_control_path_rejects_null_bytes() {
+        assert!(sanitize_control_path("foo\0bar.png").is_err());
+    }
+
+    #[test]
+    fn sanitize_control_path_rejects_traversal() {
+        assert!(sanitize_control_path("../foo.png").is_err());
+        assert!(sanitize_control_path("foo/../bar.png").is_err());
+        assert!(sanitize_control_path("..").is_err());
+    }
+
+    #[test]
+    fn sanitize_control_path_allows_valid_paths() {
+        assert_eq!(sanitize_control_path("foo/bar.png"), Ok("foo/bar.png"));
+        assert_eq!(sanitize_control_path("output.svg"), Ok("output.svg"));
     }
 }

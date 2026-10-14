@@ -27,6 +27,19 @@ fn intent_index(i: Intent) -> usize {
 
 type Xf = Option<Arc<TransformF32Executor>>;
 
+/// An error encountered while parsing or handling an ICC profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum IccError {
+    #[error("invalid ICC header")]
+    InvalidHeader,
+}
+
+impl From<IccError> for CmsError {
+    fn from(e: IccError) -> Self {
+        CmsError::BadProfile(e.to_string())
+    }
+}
+
 /// A parsed ICC profile plus lazily-built transforms to/from sRGB.
 pub struct IccProfile {
     pub name: String,
@@ -75,7 +88,14 @@ impl IccProfile {
         })
     }
 
+    pub fn parse(bytes: &[u8]) -> Result<Self, CmsError> {
+        Self::from_bytes(None, bytes)
+    }
+
     pub fn from_bytes(name: Option<String>, bytes: &[u8]) -> Result<Self, CmsError> {
+        if bytes.len() > 50 * 1024 * 1024 {
+            return Err(IccError::InvalidHeader.into());
+        }
         let p = ColorProfile::new_from_slice(bytes).map_err(|e| CmsError::BadProfile(format!("{e:?}")))?;
         Ok(Self { source: bytes.to_vec(), ..Self::from_profile(name, p)? })
     }
@@ -119,8 +139,9 @@ impl IccProfile {
 
     /// Device values (RGB / CMYK / Gray, 0..1) → sRGB.
     pub fn to_srgb(&self, v: &[f32], intent: Intent) -> Option<[f32; 3]> {
+        let clean = |x: f32| if x.is_finite() { x.clamp(0.0, 1.0) } else { 0.0 };
         let xf = self.to_xf(intent)?;
-        let mut src = v.to_vec();
+        let mut src: Vec<f32> = v.iter().copied().map(clean).collect();
         src.resize(self.channels(), 0.0);
         let mut dst = [0.0f32; 3];
         xf.transform(&src, &mut dst).ok()?;
@@ -129,9 +150,11 @@ impl IccProfile {
 
     /// sRGB → device values.
     pub fn from_srgb(&self, rgb: [f32; 3], intent: Intent) -> Option<Vec<f32>> {
+        let clean = |x: f32| if x.is_finite() { x.clamp(0.0, 1.0) } else { 0.0 };
         let xf = self.inverse_xf(intent)?;
+        let cleaned_rgb = rgb.map(clean);
         let mut dst = vec![0.0f32; self.channels()];
-        xf.transform(&rgb, &mut dst).ok()?;
+        xf.transform(&cleaned_rgb, &mut dst).ok()?;
         Some(dst.into_iter().map(|x| x.clamp(0.0, 1.0)).collect())
     }
 

@@ -2,7 +2,7 @@
 //! thumbnails), on the lexer of [`crate::encrypt`]: where each object's parts lie, what it refers
 //! to, and the references to renumber.
 
-use crate::encrypt::{Lexer, Obj, Tok, int, stream_spans};
+use crate::encrypt::{Lexer, Obj, Tok, int, is_white, stream_spans};
 
 impl Obj<'_> {
     /// Every object this one refers to, in file order, leaving out the values of the dictionary
@@ -37,7 +37,7 @@ pub(crate) fn indirect(pdf: &[u8], off: usize) -> Option<Indirect<'_>> {
     let value = lx.object(0)?;
     // The value ends before the white space ahead of the next token (`stream` or `endobj`).
     let (next, next_at, _) = lx.clone().next()?;
-    let end = next_at - pdf.get(..next_at)?.iter().rev().take_while(|b| b.is_ascii_whitespace()).count();
+    let end = next_at - pdf.get(..next_at)?.iter().rev().take_while(|&b| is_white(*b)).count();
     let endobj = match next {
         Tok::Word(b"endobj") => next_at,
         _ => {
@@ -59,12 +59,19 @@ pub(crate) fn ref_spans(pdf: &[u8], start: usize, end: usize) -> Vec<(usize, usi
     // The last two tokens when they are numbers: (start, value).
     let mut last: [Option<(usize, i64)>; 2] = [None, None];
     while let Some((tok, s, e)) = lx.next().filter(|t| t.1 < end) {
+        if e > end {
+            continue;
+        }
         match tok {
             Tok::Word(b"R") => {
-                if let [Some((at, n)), Some(_)] = last
-                    && let Ok(n) = u32::try_from(n)
-                {
-                    out.push((at, e, n));
+                if let [Some((at, n)), Some((_, g))] = last {
+                    let Ok(_gen_u16) = u16::try_from(g) else {
+                        last = [None, None];
+                        continue;
+                    };
+                    if let Ok(n) = u32::try_from(n) {
+                        out.push((at, e, n));
+                    }
                 }
                 last = [None, None];
             }

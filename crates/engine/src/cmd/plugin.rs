@@ -85,6 +85,19 @@ const MAX_DATA_CHARS: usize = (32 << 20) / 3 * 4 + 4;
 /// The `.wasm` extension plug-in files have (File › Open installs them).
 pub const EXTS: &[&str] = &["wasm"];
 
+fn validate_plugin_path(cmd: &str, path: &str) -> Result<()> {
+    if path.contains('\0') {
+        return Err(bad(cmd, "path contains null byte"));
+    }
+    if path.starts_with("\\\\") || path.starts_with("//") {
+        return Err(bad(cmd, "UNC paths are not allowed"));
+    }
+    if std::path::Path::new(path).components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return Err(bad(cmd, "path traversal ('..') is not allowed"));
+    }
+    Ok(())
+}
+
 fn install(_: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "plugin.install";
     let plugin = match (str_param(p, "path").filter(|s| !s.is_empty()), str_param(p, "dataBase64")) {
@@ -99,7 +112,10 @@ fn install(_: &mut Session, p: &Value) -> Result<Value> {
                 None => plugin,
             }
         }
-        (Some(path), None) => load_path(path)?,
+        (Some(path), None) => {
+            validate_plugin_path(C, path)?;
+            load_path(path)?
+        }
         (None, None) => return Err(bad(C, "give `path` (a .wasm file) or `dataBase64` (the module)")),
     };
     if !p.get("replace").and_then(Value::as_bool).unwrap_or(true) && registry::get(plugin.id()).is_some() {
@@ -110,11 +126,13 @@ fn install(_: &mut Session, p: &Value) -> Result<Value> {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn load_path(path: &str) -> Result<Plugin> {
+    validate_plugin_path("plugin.install", path)?;
     registry::load_file(std::path::Path::new(path), vectorcraft_plugins::Limits::default()).map_err(err)
 }
 
 #[cfg(target_arch = "wasm32")]
-fn load_path(_: &str) -> Result<Plugin> {
+fn load_path(path: &str) -> Result<Plugin> {
+    validate_plugin_path("plugin.install", path)?;
     Err(EngineError::Other("installing from a path is not available on the web; pass the module as `dataBase64`".into()))
 }
 
@@ -159,6 +177,7 @@ fn reload(s: &mut Session, p: &Value) -> Result<Value> {
     if folder.is_empty() {
         return Err(bad(C, "no folder: pass `path` or set Preferences › Performance & Storage › Additional Plug-ins Folder"));
     }
+    validate_plugin_path(C, &folder)?;
     let report = load_folder(&folder);
     if let Some(e) = report.get("error").and_then(Value::as_str) {
         return Err(EngineError::Other(e.to_string()));

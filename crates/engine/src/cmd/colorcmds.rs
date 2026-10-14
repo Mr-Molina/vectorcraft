@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde_json::{Value, json};
-use vectorcraft_color::cms::Model;
+use vectorcraft_color::cms::{Model, delta_e2000};
 use vectorcraft_color::harmony::{Guide, GuideOptions, Harmony, Variation};
 use vectorcraft_color::{Color, Paint, keep_model};
 use vectorcraft_doc::live::lerp_color;
@@ -118,13 +118,22 @@ pub fn specs() -> Vec<CommandSpec> {
             harmony
         ),
         cmd!(
-            "color.cluster",
+            query "color.cluster",
             "Cluster by Color",
-            ["Object", "Color"],
+            [],
             None,
-            "{max_delta_e: float, action: 'preview'|'group', node_ids?: [int]}",
+            "{maxDeltaE: 0..200 (CIEDE2000 threshold; 0 = exact matches), ids?: [id…] (default: the selection; at most 100000)} read-only preview of edit.colors.groupByColor: objects clustered by fill colour (solid fills, type's first fill, a mesh's average colour; alpha and opacity are ignored). Leader clustering: each member is within maxDeltaE of its cluster's colour, so two members can be up to about 2·maxDeltaE apart; clusters never span parents (layers or groups). Locked, hidden, clipping-path and gradient/pattern/unfilled objects go to `skipped` → {clusters: [{name, hex, ids: [id…] (paint order), avgDeltaE (mean ΔE to the cluster colour over the members other than the representative; 0 for one member)}], skipped: [{id, reason}]}",
             has_doc,
             color_cluster
+        ),
+        cmd!(
+            "edit.colors.groupByColor",
+            "Group by Color",
+            ["Edit", "Edit Colors"],
+            None,
+            "{maxDeltaE, ids?} (as color.cluster) group each cluster of two or more objects (named by its colour, where its front-most member was; members keep their order and parent) and select the new groups, as one undo step → {groups: [id…], clusters, skipped}",
+            has_selection_or_ids,
+            group_by_color
         ),
     ]
 }
@@ -532,80 +541,286 @@ fn harmony(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "rule": rule.id(), "colors": hex(&g.colors), "grid": g.grid.iter().map(|r| hex(r)).collect::<Vec<_>>() }))
 }
 
-fn color_cluster(s: &mut Session, p: &Value) -> Result<Value> {
-    let max_delta_e = p.get("max_delta_e").and_then(Value::as_f64).ok_or_else(|| bad("color.cluster", "missing or invalid max_delta_e"))?;
-    if !max_delta_e.is_finite() || max_delta_e <= 0.0 {
-        return Err(bad("color.cluster", "max_delta_e must be a positive finite number"));
-    }
-    let action = p.get("action").and_then(Value::as_str).unwrap_or("preview");
-    if action != "preview" && action != "group" {
-        return Err(bad("color.cluster", "action must be 'preview' or 'group'"));
-    }
+/// Most objects `color.cluster` and `edit.colors.groupByColor` take in one call.
+const CLUSTER_MAX_IDS: usize = 100_000;
+/// Largest `maxDeltaE` (CIEDE2000 between black and white is 100; 200 leaves room).
+const CLUSTER_MAX_DELTA_E: f64 = 200.0;
 
-    let doc_handle = s.doc()?;
-    let doc = &doc_handle.doc;
-    let target_ids: Vec<NodeId> = if let Some(arr) = p.get("node_ids").and_then(Value::as_array) {
-        arr.iter().filter_map(Value::as_u64).map(NodeId).collect()
-    } else {
-        doc.layers.iter().flat_map(|l| l.children().into_iter().flatten().map(|c| c.id)).collect()
-    };
+/// Where an object sits, from one walk of the tree.
+struct Placed<'a> {
+    node: &'a Node,
+    parent: Option<NodeId>,
+    /// The parent is a compound path: its members act as the compound.
+    in_compound: bool,
+    /// The object is inside a live object (blend, envelope, repeat), at any depth: its art can't
+    /// be regrouped.
+    in_live: bool,
+    /// Pre-order index: paint order among siblings, parents before children.
+    order: usize,
+    /// The object or an ancestor is locked.
+    locked: bool,
+    /// The object or an ancestor is hidden.
+    hidden: bool,
+    /// A clipping path (flagged, or the first child of a clip group or clip layer).
+    clip: bool,
+}
 
-    let mut items: Vec<(u64, Color)> = Vec::new();
-    for &id in &target_ids {
-        if let Some(node) = doc.node(id)
-            && let Some(col) = node.appearance.fill_paint().color()
-        {
-            items.push((id.0, col));
+/// Inherited state while walking down the tree.
+#[derive(Clone, Copy, Default)]
+struct Inherited {
+    locked: bool,
+    hidden: bool,
+    live: bool,
+}
+
+/// Every node of `d` by id, in one walk (instead of a tree search per id).
+fn index_tree(d: &Document) -> HashMap<NodeId, Placed<'_>> {
+    fn visit<'a>(n: &'a Node, parent: Option<&'a Node>, first: bool, up: Inherited, out: &mut HashMap<NodeId, Placed<'a>>) {
+        let (in_compound, parent_live, parent_clips) = match parent.map(|p| &p.kind) {
+            None => (false, false, false),
+            Some(NodeKind::Compound { .. }) => (true, false, false),
+            Some(NodeKind::Group { clip, .. } | NodeKind::Layer { clip, .. }) => (false, false, *clip),
+            Some(_) => (false, true, false),
+        };
+        let here = Inherited { locked: up.locked || n.locked, hidden: up.hidden || !n.visible, live: up.live || parent_live };
+        let clip = matches!(n.kind, NodeKind::Path { clipping: true, .. }) || (parent_clips && first);
+        let order = out.len();
+        out.insert(
+            n.id,
+            Placed { node: n, parent: parent.map(|p| p.id), in_compound, in_live: here.live, order, locked: here.locked, hidden: here.hidden, clip },
+        );
+        for (i, c) in n.children().into_iter().flatten().enumerate() {
+            visit(c, Some(n), i == 0, here, out);
         }
     }
+    let mut out = HashMap::new();
+    for l in &d.layers {
+        visit(l, None, false, Inherited::default(), &mut out);
+    }
+    out
+}
 
-    let clusters = vectorcraft_color::recolor::cluster_colors_by_delta_e(&items, max_delta_e);
-    let cluster_json: Vec<Value> = clusters
+/// Enabled with a document: menus act on the selection, agents may pass `ids` instead (the run
+/// function reports a missing scope).
+fn has_selection_or_ids(s: &Session) -> std::result::Result<(), String> {
+    has_doc(s)
+}
+
+/// `{maxDeltaE, ids?}`: the threshold and the objects (default: the selected top-level objects).
+/// With `need_scope`, neither `ids` nor a selection is an error.
+fn cluster_params(s: &Session, p: &Value, cmd: &str, need_scope: bool) -> Result<(f64, Vec<NodeId>)> {
+    let t = p.get("maxDeltaE").and_then(Value::as_f64).ok_or_else(|| bad(cmd, "missing number `maxDeltaE`"))?;
+    if !t.is_finite() || !(0.0..=CLUSTER_MAX_DELTA_E).contains(&t) {
+        return Err(bad(cmd, format!("`maxDeltaE` must be a number from 0 to {CLUSTER_MAX_DELTA_E}")));
+    }
+    let ids = match p.get("ids") {
+        None | Some(Value::Null) => {
+            let sel = selected_roots(s)?;
+            if need_scope && sel.is_empty() {
+                return Err(bad(cmd, "select objects or pass `ids`"));
+            }
+            sel
+        }
+        Some(Value::Array(a)) => {
+            if a.len() > CLUSTER_MAX_IDS {
+                return Err(bad(cmd, format!("at most {CLUSTER_MAX_IDS} `ids`")));
+            }
+            let ids = a
+                .iter()
+                .map(|v| v.as_u64().map(NodeId).ok_or_else(|| bad(cmd, "`ids` must hold non-negative integer ids")))
+                .collect::<Result<Vec<_>>>()?;
+            if need_scope && ids.is_empty() {
+                return Err(bad(cmd, "select objects or pass `ids`"));
+            }
+            ids
+        }
+        Some(_) => return Err(bad(cmd, "`ids` must be an array of ids")),
+    };
+    if ids.len() > CLUSTER_MAX_IDS {
+        return Err(bad(cmd, format!("at most {CLUSTER_MAX_IDS} objects")));
+    }
+    Ok((t, ids))
+}
+
+/// One cluster as reported and grouped: members share a parent and are in paint order.
+struct PlannedCluster {
+    name: String,
+    hex: String,
+    ids: Vec<NodeId>,
+    avg_delta_e: f64,
+}
+
+struct ClusterPlan {
+    clusters: Vec<PlannedCluster>,
+    skipped: Vec<(u64, &'static str)>,
+}
+
+impl ClusterPlan {
+    fn clusters_json(&self) -> Value {
+        self.clusters
+            .iter()
+            .map(|c| json!({ "name": c.name, "hex": c.hex, "ids": c.ids.iter().map(|i| i.0).collect::<Vec<_>>(), "avgDeltaE": c.avg_delta_e }))
+            .collect()
+    }
+    fn skipped_json(&self) -> Value {
+        self.skipped.iter().map(|(id, reason)| json!({ "id": id, "reason": reason })).collect()
+    }
+}
+
+/// Why an object without a colour to cluster by was skipped.
+fn no_color_reason(n: &Node) -> &'static str {
+    let reason = |p: &Paint| match p {
+        Paint::Gradient(_) => "gradient",
+        Paint::Pattern { .. } => "pattern",
+        _ => "no fill",
+    };
+    match &n.kind {
+        NodeKind::Text(t) => reason(&t.first_style().fill),
+        NodeKind::Mesh(_) => "no fill",
+        _ => reason(&n.appearance.fill_paint()),
+    }
+}
+
+/// The clusters `color.cluster` shows and `edit.colors.groupByColor` makes, computed once so both
+/// agree (names included).
+fn plan_clusters(d: &Document, ids: &[NodeId], max_delta_e: f64) -> ClusterPlan {
+    let index = index_tree(d);
+    let mut missing = std::collections::BTreeSet::new();
+    // Compound-path members act as their compound; duplicates collapse.
+    let mut wanted: HashSet<NodeId> = HashSet::with_capacity(ids.len());
+    for &id in ids {
+        match index.get(&id) {
+            None => {
+                missing.insert(id.0);
+            }
+            Some(pl) => {
+                wanted.insert(match pl.parent {
+                    Some(p) if pl.in_compound => p,
+                    _ => id,
+                });
+            }
+        }
+    }
+    // Drop objects whose ancestor is listed too (the ancestor carries them).
+    let mut roots: Vec<(NodeId, &Placed)> = wanted
         .iter()
-        .map(|c| {
-            let [r, g, b, _] = c.representative.to_rgba8(1.0);
-            json!({
-                "group_name": format!("Color #{r:02x}{g:02x}{b:02x}"),
-                "hex": format!("#{r:02x}{g:02x}{b:02x}"),
-                "node_ids": c.node_ids,
-                "avg_delta_e": c.avg_delta_e
-            })
+        .filter_map(|&id| {
+            let pl = index.get(&id)?;
+            let mut up = pl.parent;
+            while let Some(a) = up {
+                if wanted.contains(&a) {
+                    return None;
+                }
+                up = index.get(&a).and_then(|x| x.parent);
+            }
+            Some((id, pl))
         })
         .collect();
+    roots.sort_by_key(|(_, pl)| pl.order);
 
-    if action == "preview" {
-        return Ok(json!({
-            "clusters": cluster_json,
-            "modified_node_count": 0
-        }));
+    let mut skipped = vec![];
+    let mut items: Vec<(u64, Color)> = vec![];
+    for (id, pl) in &roots {
+        let reason = if pl.node.is_layer() {
+            Some("layer")
+        } else if pl.locked {
+            Some("locked")
+        } else if pl.hidden {
+            Some("hidden")
+        } else if pl.clip {
+            Some("clipping path")
+        } else if pl.in_live {
+            Some("inside a live object")
+        } else {
+            None
+        };
+        match (reason, fill_color(pl.node)) {
+            (Some(r), _) => skipped.push((id.0, r)),
+            (None, Some(c)) => items.push((id.0, c)),
+            (None, None) => skipped.push((id.0, no_color_reason(pl.node))),
+        }
     }
+    skipped.extend(missing.into_iter().map(|id| (id, "not found")));
 
-    if action == "group" {
-        let mut modified = 0;
-        s.edit("Cluster by Color", |d, _sel| {
-            for c in &clusters {
-                let [r, g, b, _] = c.representative.to_rgba8(1.0);
-                let group_name = format!("Color #{r:02x}{g:02x}{b:02x}");
-                let gid = d.alloc_id();
-                let mut gnode = Node::group(gid, vec![]);
-                gnode.name = Some(group_name);
-                if let Some(first_id) = c.node_ids.first()
-                    && let Some((par, idx, _)) = d.position(NodeId(*first_id))
-                {
-                    d.insert(par, idx + 1, gnode)?;
-                    for &nid in &c.node_ids {
-                        d.move_node(NodeId(nid), Some(gid), usize::MAX)?;
-                        modified += 1;
-                    }
-                }
+    let colors: HashMap<u64, Color> = items.iter().copied().collect();
+    // Split each colour cluster by parent so grouping never moves art across layers or groups.
+    let mut pieces: Vec<(usize, Color, Vec<NodeId>, f64)> = vec![];
+    for c in vectorcraft_color::recolor::cluster_colors_by_delta_e(&items, max_delta_e) {
+        let rep_lab = c.representative.to_lab();
+        // The representative object: the first member with the cluster's exact colour.
+        let rep_id = c.node_ids.iter().copied().find(|id| colors.get(id) == Some(&c.representative));
+        let mut by_parent: Vec<Vec<(usize, NodeId)>> = vec![];
+        let mut slot: HashMap<Option<NodeId>, usize> = HashMap::new();
+        for id in c.node_ids.iter().map(|i| NodeId(*i)) {
+            let Some(pl) = index.get(&id) else { continue };
+            let k = *slot.entry(pl.parent).or_insert_with(|| {
+                by_parent.push(vec![]);
+                by_parent.len() - 1
+            });
+            if let Some(v) = by_parent.get_mut(k) {
+                v.push((pl.order, id));
             }
-            Ok(())
-        })?;
-        return Ok(json!({
-            "clusters": cluster_json,
-            "modified_node_count": modified
-        }));
+        }
+        for mut members in by_parent {
+            members.sort_unstable();
+            let Some(&(first, _)) = members.first() else { continue };
+            let des: Vec<f64> = members
+                .iter()
+                .filter(|(_, id)| Some(id.0) != rep_id)
+                .filter_map(|(_, id)| colors.get(&id.0))
+                .map(|col| delta_e2000(rep_lab, col.to_lab()) as f64)
+                .collect();
+            let avg = if members.len() < 2 || des.is_empty() { 0.0 } else { des.iter().sum::<f64>() / des.len() as f64 };
+            pieces.push((first, c.representative, members.into_iter().map(|(_, id)| id).collect(), avg));
+        }
     }
+    pieces.sort_by_key(|p| p.0);
+    // Names from the colour, made unique with a counter.
+    let mut used: HashMap<String, usize> = HashMap::new();
+    let clusters = pieces
+        .into_iter()
+        .map(|(_, color, ids, avg_delta_e)| {
+            let hex = color.to_hex();
+            let base = format!("Color {hex}");
+            let n = used.entry(base.clone()).or_insert(0);
+            *n += 1;
+            let name = if *n == 1 { base } else { format!("{base} {n}") };
+            PlannedCluster { name, hex, ids, avg_delta_e }
+        })
+        .collect();
+    ClusterPlan { clusters, skipped }
+}
 
-    Err(bad("color.cluster", "action must be 'preview' or 'group'"))
+fn color_cluster(s: &mut Session, p: &Value) -> Result<Value> {
+    let (t, ids) = cluster_params(s, p, "color.cluster", false)?;
+    let plan = plan_clusters(&s.doc()?.doc, &ids, t);
+    Ok(json!({ "clusters": plan.clusters_json(), "skipped": plan.skipped_json() }))
+}
+
+fn group_by_color(s: &mut Session, p: &Value) -> Result<Value> {
+    let (t, ids) = cluster_params(s, p, "edit.colors.groupByColor", true)?;
+    let plan = plan_clusters(&s.doc()?.doc, &ids, t);
+    let todo: Vec<(&[NodeId], &str)> = plan.clusters.iter().filter(|c| c.ids.len() >= 2).map(|c| (c.ids.as_slice(), c.name.as_str())).collect();
+    // Nothing to group: no undo step.
+    let groups = if todo.is_empty() {
+        vec![]
+    } else {
+        s.edit("Group by Color", |d, sel| {
+            let mut gids = Vec::with_capacity(todo.len());
+            for (ids, name) in &todo {
+                let gid = super::object::group_nodes(d, ids)?;
+                if let Some(g) = d.node_mut(gid) {
+                    g.name = Some((*name).to_string());
+                }
+                gids.push(gid);
+            }
+            sel.set(gids.clone());
+            Ok(gids)
+        })?
+    };
+    Ok(json!({
+        "groups": groups.iter().map(|g| g.0).collect::<Vec<_>>(),
+        "clusters": plan.clusters_json(),
+        "skipped": plan.skipped_json(),
+    }))
 }

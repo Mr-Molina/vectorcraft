@@ -8,6 +8,8 @@ use crate::ps;
 
 /// Deepest procedure nesting the scanner reads.
 const MAX_NESTING: usize = 256;
+/// Most bytes a single string or literal token may occupy.
+const MAX_TOKEN_BYTES: usize = 16 * 1024 * 1024;
 
 pub(crate) struct Lexer<'a> {
     src: &'a [u8],
@@ -183,12 +185,17 @@ impl<'a> Lexer<'a> {
         loop {
             let Some(b) = self.peek() else { return syntax("(") };
             self.pos += 1;
+            if b == b')' && depth == 0 {
+                return Ok(out);
+            }
+            if out.len() >= MAX_TOKEN_BYTES {
+                return Err(PsError::Limit("token too large"));
+            }
             match b {
                 b'(' => {
                     depth += 1;
                     out.push(b);
                 }
-                b')' if depth == 0 => return Ok(out),
                 b')' => {
                     depth -= 1;
                     out.push(b);
@@ -231,19 +238,46 @@ impl<'a> Lexer<'a> {
 
     /// A hexadecimal string after its `<`.
     fn hex(&mut self) -> Res<Vec<u8>> {
-        let end = self.rest().iter().position(|b| *b == b'>').ok_or(PsError::Ps("syntaxerror", "<".into()))?;
+        let max_search = self.rest().len().min(MAX_TOKEN_BYTES * 3);
+        let end = match self.rest().get(..max_search).unwrap_or_default().iter().position(|b| *b == b'>') {
+            Some(end) => end,
+            None => {
+                if self.rest().len() > MAX_TOKEN_BYTES * 3 {
+                    return Err(PsError::Limit("token too large"));
+                }
+                return Err(PsError::Ps("syntaxerror", "<".into()));
+            }
+        };
         let body = self.rest().get(..end).unwrap_or_default();
         let out = hex_decode(body).ok_or(PsError::Ps("syntaxerror", "<".into()))?;
+        if out.len() > MAX_TOKEN_BYTES {
+            return Err(PsError::Limit("token too large"));
+        }
         self.advance(end + 1);
         Ok(out)
     }
 
     /// An ASCII85 string after its `<~`.
     fn ascii85(&mut self) -> Res<Vec<u8>> {
-        let end = find(self.rest(), b"~>").ok_or(PsError::Ps("syntaxerror", "<~".into()))?;
-        let text = String::from_utf8_lossy(self.rest().get(..end + 2).unwrap_or_default()).into_owned();
+        let max_search = self.rest().len().min(MAX_TOKEN_BYTES * 3);
+        let search_slice = self.rest().get(..max_search).unwrap_or_default();
+        let end = match find(search_slice, b"~>") {
+            Some(end) => end,
+            None => {
+                if self.rest().len() > MAX_TOKEN_BYTES * 3 {
+                    return Err(PsError::Limit("token too large"));
+                }
+                return Err(PsError::Ps("syntaxerror", "<~".into()));
+            }
+        };
+        let body = self.rest().get(..end + 2).unwrap_or_default();
+        let text = String::from_utf8_lossy(body).into_owned();
         self.advance(end + 2);
-        ps::ascii85_decode(&text).ok_or(PsError::Ps("syntaxerror", "<~".into()))
+        let out = ps::ascii85_decode(&text).ok_or(PsError::Ps("syntaxerror", "<~".into()))?;
+        if out.len() > MAX_TOKEN_BYTES {
+            return Err(PsError::Limit("token too large"));
+        }
+        Ok(out)
     }
 }
 

@@ -1,0 +1,248 @@
+diff --git a/crates/render/src/lib.rs b/crates/render/src/lib.rs
+index 42d68dc0..2de94d38 100644
+--- a/crates/render/src/lib.rs
++++ b/crates/render/src/lib.rs
+@@ -21,7 +21,7 @@ pub mod proof;
+ use std::collections::HashMap;
+ use std::sync::Arc;
+ 
+-use vectorcraft_doc::{AppearanceItem, Document, Node, NodeId, NodeKind, StrokeAlign, StrokeLayer, TextObject};
++use vectorcraft_doc::{AppearanceItem, Document, Node, NodeId, NodeKind, StrokeAlign, StrokeLayer, TextObject, TraceView};
+ use vectorcraft_geom::{Affine, BezPath, FillRule, Rect, Shape};
+ use vello_cpu::kurbo;
+ use vello_cpu::peniko::{self, BlendMode, Compose, Mix};
+@@ -637,7 +637,7 @@ impl Renderer {
+             NodeKind::Layer { children, clip: false, .. } | NodeKind::Group { children, clip: false } if !fx::has_object_fx(a) => {
+                 let mut acc: Option<Rect> = None;
+                 for c in children {
+-                    if c.visible {
++                    if c.visible || (is_trace_group(a) && matches!(a.trace_view(), TraceView::SourceImage | TraceView::OutlinesWithSource)) {
+                         acc = vectorcraft_geom::union_opt(acc, self.bounds_of(c));
+                     }
+                 }
+@@ -871,6 +871,45 @@ impl Renderer {
+ 
+     /// What `n` draws inside its transparency group (`knockout`: its children knock each other out).
+     fn draw_content(&mut self, ctx: &mut RenderContext, f: &Frame, n: &Node, knockout: bool) {
++        if is_trace_group(n) && !f.opts.outline {
++            let view = n.trace_view();
++            if let NodeKind::Group { children, .. } = &n.kind
++                && let Some((source_img, vector_paths)) = children.split_first()
++            {
++                match view {
++                    TraceView::TracingResult => {
++                        self.draw_children(ctx, f, vector_paths, knockout);
++                    }
++                    TraceView::TracingResultWithOutlines => {
++                        self.draw_children(ctx, f, vector_paths, knockout);
++                        for vp in vector_paths {
++                            if let Some(bp) = vp.stroke_path() {
++                                self.hairline(ctx, f, &bp, [0, 160, 255, 255]);
++                            }
++                        }
++                    }
++                    TraceView::Outlines => {
++                        for vp in vector_paths {
++                            if let Some(bp) = vp.stroke_path() {
++                                self.hairline(ctx, f, &bp, [0, 0, 0, 255]);
++                            }
++                        }
++                    }
++                    TraceView::OutlinesWithSource => {
++                        self.draw_node(ctx, f, source_img, true);
++                        for vp in vector_paths {
++                            if let Some(bp) = vp.stroke_path() {
++                                self.hairline(ctx, f, &bp, [0, 160, 255, 255]);
++                            }
++                        }
++                    }
++                    TraceView::SourceImage => {
++                        self.draw_node(ctx, f, source_img, true);
++                    }
++                }
++                return;
++            }
++        }
+         match &n.kind {
+             NodeKind::Layer { children, clip: false, .. } | NodeKind::Group { children, clip: false } => {
+                 self.draw_children(ctx, f, children, knockout)
+@@ -1455,6 +1494,13 @@ impl Renderer {
+     }
+ }
+ 
++/// Whether `n` is an Image Trace group: a non-clipping group named "Image Trace" whose first child is an Image.
++fn is_trace_group(n: &Node) -> bool {
++    matches!(n.kind, NodeKind::Group { clip: false, .. })
++        && n.name.as_deref() == Some("Image Trace")
++        && n.children().is_some_and(|c| c.first().is_some_and(|i| matches!(i.kind, NodeKind::Image(_))))
++}
++
+ /// Can image node `n` (`im`) clipped by `region` be painted straight into the region: visible,
+ /// with no transparency, effects or paint of its own, and the region inside the image's frame
+ /// (within a pixel), so no paint past the image's edge shows?
+diff --git a/crates/render/tests/trace_render_tests.rs b/crates/render/tests/trace_render_tests.rs
+new file mode 100644
+index 00000000..b33a2bda
+--- /dev/null
++++ b/crates/render/tests/trace_render_tests.rs
+@@ -0,0 +1,160 @@
++//! Integration tests for Image Trace multi-mode hairline and bitmap rendering.
++#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
++
++use std::sync::Arc;
++use vectorcraft_color::{Color, Paint};
++use vectorcraft_doc::{Appearance, Document, Node, NodeId, NodeKind, TraceView};
++use vectorcraft_geom::{Affine, Rect, Shape};
++use vectorcraft_render::{RenderOptions, Renderer};
++
++#[test]
++fn test_render_all_five_trace_view_modes() {
++    let mut doc = Document::new(200.0, 200.0);
++    let mut r = Renderer::new();
++
++    // Encode a 10x10 mock PNG using image::RgbaImage directly (avoiding undeclared trace dependency)
++    let img = image::RgbaImage::from_pixel(10, 10, image::Rgba([255, 0, 0, 255]));
++    let mut png_bytes = Vec::new();
++    img.write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png).unwrap();
++    doc.images.insert("test_key".into(), vectorcraft_doc::ImageBlob::new("image/png", png_bytes));
++
++    let mut img_node = Node::new(
++        NodeId(10),
++        NodeKind::Image(vectorcraft_doc::ImageObject {
++            key: "test_key".into(),
++            xf: Affine::IDENTITY,
++            width: 100,
++            height: 100,
++            link: None,
++            placement: Default::default(),
++        }),
++    );
++    img_node.name = Some("Source Image".into());
++    img_node.visible = false;
++
++    let rect_path = vectorcraft_geom::PathData::from_bezpath(&Rect::new(10.0, 10.0, 90.0, 90.0).to_path(0.1));
++    let mut rect_node = Node::path(NodeId(11), rect_path, Appearance::default());
++    rect_node.appearance.set_fill(Paint::solid(Color::rgb8(0, 0, 255)));
++
++    let mut trace_group = Node::group(NodeId(1), vec![Arc::new(img_node), Arc::new(rect_node)]);
++    trace_group.name = Some("Image Trace".into());
++
++    let opts = RenderOptions { outline: false, background: Some([255, 255, 255, 255]), artboards: true, ..Default::default() };
++
++    for view in
++        [TraceView::TracingResult, TraceView::TracingResultWithOutlines, TraceView::Outlines, TraceView::OutlinesWithSource, TraceView::SourceImage]
++    {
++        trace_group.set_trace_view(view);
++        let mut test_doc = doc.clone();
++        test_doc.insert(None, 0, trace_group.clone()).unwrap();
++        let rendered = r.render(&test_doc, 200, 200, Affine::IDENTITY, &opts);
++        assert_eq!(rendered.width, 200);
++        assert_eq!(rendered.height, 200);
++        assert!(rendered.pixels.iter().any(|&b| b != 0));
++
++        let px_at = |x: usize, y: usize| -> [u8; 4] {
++            let idx = (y * 200 + x) * 4;
++            [rendered.pixels[idx], rendered.pixels[idx + 1], rendered.pixels[idx + 2], rendered.pixels[idx + 3]]
++        };
++
++        // Differentiate mode behaviors at center (50, 50):
++        let center = px_at(50, 50);
++        match view {
++            TraceView::TracingResult => {
++                // Vector path fill is blue: [0, 0, 255, 255]
++                assert_eq!(center, [0, 0, 255, 255], "TracingResult should show vector blue fill");
++            }
++            TraceView::TracingResultWithOutlines => {
++                // Vector path fill is blue at center: [0, 0, 255, 255]
++                assert_eq!(center, [0, 0, 255, 255], "TracingResultWithOutlines should show vector blue fill");
++                // On the border at (10, 50), hairline [0, 160, 255, 255] is painted
++                let edge = px_at(10, 50);
++                assert!(edge[1] > 50, "TracingResultWithOutlines edge should have cyan green component, got {edge:?}");
++            }
++            TraceView::Outlines => {
++                // Outlines only: interior is white background [255, 255, 255, 255]
++                assert_eq!(center, [255, 255, 255, 255], "Outlines should show background at center");
++                // On the border at (10, 50), black hairline [0, 0, 0, 255] antialiased over white background
++                let edge = px_at(10, 50);
++                assert!(edge[0] < 200 && edge[1] < 200 && edge[2] < 200, "Outlines edge should be darkened by black hairline, got {edge:?}");
++            }
++            TraceView::OutlinesWithSource => {
++                // Source image is red: [255, 0, 0, 255]
++                assert_eq!(center, [255, 0, 0, 255], "OutlinesWithSource should show red image at center");
++                // On the border at (10, 50), hairline [0, 160, 255, 255] is painted
++                let edge = px_at(10, 50);
++                assert!(edge[1] > 50 || edge[2] > 50, "OutlinesWithSource edge should have cyan component, got {edge:?}");
++            }
++            TraceView::SourceImage => {
++                // Source image is red: [255, 0, 0, 255]
++                assert_eq!(center, [255, 0, 0, 255], "SourceImage should show red image at center");
++            }
++        }
++    }
++}
++
++#[test]
++fn test_render_trace_group_with_missing_image_graceful_fallback() {
++    let mut doc = Document::new(200.0, 200.0);
++    let mut r = Renderer::new();
++
++    let mut corrupt_group = Node::group(NodeId(1), vec![]);
++    corrupt_group.name = Some("Image Trace".into());
++    corrupt_group.set_trace_view(TraceView::SourceImage);
++
++    doc.insert(None, 0, corrupt_group).unwrap();
++    let opts = RenderOptions::default();
++    let rendered = r.render(&doc, 200, 200, Affine::IDENTITY, &opts);
++    assert_eq!(rendered.width, 200);
++}
++
++#[test]
++fn test_render_trace_group_source_image_bounds_and_visibility() {
++    let mut doc = Document::new(200.0, 200.0);
++    let mut r = Renderer::new();
++
++    // 10x10 green image positioned at (0, 0)
++    let img = image::RgbaImage::from_pixel(10, 10, image::Rgba([0, 255, 0, 255]));
++    let mut png_bytes = Vec::new();
++    img.write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png).unwrap();
++    doc.images.insert("green_img".into(), vectorcraft_doc::ImageBlob::new("image/png", png_bytes));
++
++    let mut img_node = Node::new(
++        NodeId(10),
++        NodeKind::Image(vectorcraft_doc::ImageObject {
++            key: "green_img".into(),
++            xf: Affine::IDENTITY,
++            width: 50,
++            height: 50,
++            link: None,
++            placement: Default::default(),
++        }),
++    );
++    img_node.visible = false;
++
++    // Vector path at (100, 100) -> (150, 150)
++    let rect_path = vectorcraft_geom::PathData::from_bezpath(&Rect::new(100.0, 100.0, 150.0, 150.0).to_path(0.1));
++    let mut rect_node = Node::path(NodeId(11), rect_path, Appearance::default());
++    rect_node.appearance.set_fill(Paint::solid(Color::rgb8(0, 0, 255)));
++
++    let mut trace_group = Node::group(NodeId(1), vec![Arc::new(img_node), Arc::new(rect_node)]);
++    trace_group.name = Some("Image Trace".into());
++    trace_group.set_trace_view(TraceView::SourceImage);
++
++    // Enclosing group
++    let parent_group = Node::group(NodeId(2), vec![Arc::new(trace_group)]);
++    doc.insert(None, 0, parent_group).unwrap();
++
++    let opts = RenderOptions { background: Some([255, 255, 255, 255]), ..Default::default() };
++    let rendered = r.render(&doc, 200, 200, Affine::IDENTITY, &opts);
++
++    // Green image should be visible at (25, 25)
++    let idx = (25 * 200 + 25) * 4;
++    let px = [rendered.pixels[idx], rendered.pixels[idx + 1], rendered.pixels[idx + 2], rendered.pixels[idx + 3]];
++    assert_eq!(px, [0, 255, 0, 255], "SourceImage inside parent group should render green image even though node.visible is false");
++
++    // Vector path should NOT be rendered in SourceImage mode
++    let idx_vec = (125 * 200 + 125) * 4;
++    let px_vec = [rendered.pixels[idx_vec], rendered.pixels[idx_vec + 1], rendered.pixels[idx_vec + 2], rendered.pixels[idx_vec + 3]];
++    assert_eq!(px_vec, [255, 255, 255, 255], "Vector path should not be drawn in SourceImage mode");
++}

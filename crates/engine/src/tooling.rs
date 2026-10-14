@@ -236,7 +236,7 @@ impl Session {
             Ok(r) => r,
             Err(msg) => {
                 // A bug in the tool: start it afresh and drop its half-done drag.
-                let id = self.tool.id();
+                let id = self.lender.take().map_or_else(|| self.tool.id(), |l| l.id());
                 self.tool = self.make_tool(id);
                 let _ = self.cancel_interaction();
                 self.tool_panic = Some(EngineError::Internal { cmd: format!("tool `{id}`"), msg });

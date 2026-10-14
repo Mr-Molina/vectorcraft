@@ -218,49 +218,56 @@ fn log_records_go_out_as_notifications_once_asked_for() {
     result(&mut s, 4, "logging/setLevel", json!({"level": null}));
 }
 
-// ---------- agent extensions ----------
+// ---------- agent options folded into the core tools ----------
 
+/// The semantic summary, the overlay and colour clustering are options of existing tools (or plain
+/// commands), not tools of their own.
 #[test]
-fn test_mcp_tools_include_agent_extensions() {
+fn agent_extensions_are_options_not_extra_tools() {
     let defs = tool_definitions();
     let names: Vec<&str> = defs.iter().filter_map(|t| t["name"].as_str()).collect();
-    assert!(names.contains(&"semantic_summary"), "missing semantic_summary in {names:?}");
-    assert!(names.contains(&"cluster_colors"), "missing cluster_colors in {names:?}");
-    assert!(names.contains(&"render_overlay"), "missing render_overlay in {names:?}");
+    for gone in ["semantic_summary", "cluster_colors", "render_overlay"] {
+        assert!(!names.contains(&gone), "{gone} should not be a tool: {names:?}");
+    }
 }
 
 #[test]
-fn test_mcp_semantic_summary_tool_call() {
-    let mut s = server();
-    let r = result(&mut s, 1, "tools/call", json!({"name": "semantic_summary", "arguments": {}}));
-    assert_eq!(r["isError"], false, "{r}");
-    let text = r["content"][0]["text"].as_str().expect("text content");
-    let val: Value = serde_json::from_str(text).expect("valid JSON response");
-    assert!(val.get("group_count").is_some(), "missing group_count: {val}");
-    assert!(val.get("loose_path_count").is_some(), "missing loose_path_count: {val}");
-    assert!(val.get("artboard_count").is_some(), "missing artboard_count: {val}");
-}
-
-#[test]
-fn test_mcp_cluster_colors_tool_call() {
+fn inspect_document_summary_returns_counts() {
     let mut s = server();
     rectangle(&mut s, 1);
-    tool(&mut s, 2, "draw_shape", json!({"shape": "ellipse", "x": 100, "y": 100, "width": 50, "height": 50}));
-    let r = result(&mut s, 3, "tools/call", json!({"name": "cluster_colors", "arguments": {"max_delta_e": 10.0, "action": "preview"}}));
-    assert_eq!(r["isError"], false, "{r}");
-    let text = r["content"][0]["text"].as_str().expect("text content");
-    let val: Value = serde_json::from_str(text).expect("valid JSON response");
-    assert!(val.get("clusters").and_then(Value::as_array).is_some(), "missing clusters array: {val}");
+    let v = tool(&mut s, 2, "inspect_document", json!({"summary": true}));
+    for k in ["groupCount", "loosePathCount", "artboardCount"] {
+        assert!(v.get(k).is_some(), "missing {k}: {v}");
+    }
+    assert!(v.get("layers").is_none(), "summary replaces the layer tree: {v}");
+    let r = result(&mut s, 3, "tools/call", json!({"name": "inspect_document", "arguments": {"summary": "yes"}}));
+    assert_eq!(r["isError"], true, "{r}");
 }
 
 #[test]
-fn test_mcp_render_overlay_tool_call() {
+fn screenshot_overlay_returns_an_annotated_image() {
     let mut s = server();
     rectangle(&mut s, 1);
-    let tmp_path = std::env::temp_dir().join(format!("test_mcp_render_overlay_{}.png", std::process::id()));
-    let tmp_str = tmp_path.to_str().expect("valid path string").to_string();
-    let r = result(&mut s, 2, "tools/call", json!({"name": "render_overlay", "arguments": {"path": tmp_str}}));
+    let r = result(&mut s, 2, "tools/call", json!({"name": "screenshot", "arguments": {"overlay": true}}));
     assert_eq!(r["isError"], false, "{r}");
-    assert!(tmp_path.exists(), "overlay image was not created at {:?}", tmp_path);
-    let _ = std::fs::remove_file(&tmp_path);
+    let img = &r["content"][0];
+    assert_eq!(img["type"], "image", "{r}");
+    assert_eq!(img["mimeType"], "image/png", "{r}");
+    let png = vectorcraft_format::base64_decode(img["data"].as_str().unwrap()).unwrap();
+    assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"), "not a PNG");
+    let info: Value = serde_json::from_str(r["content"][1]["text"].as_str().unwrap()).unwrap();
+    assert!(info["annotatedCount"].as_u64().is_some_and(|n| n >= 1), "{info}");
+    assert!(info["path"].is_null(), "no path given, no file written: {info}");
+    let r = result(&mut s, 3, "tools/call", json!({"name": "screenshot", "arguments": {"overlay": true, "window": true}}));
+    assert_eq!(r["isError"], true, "{r}");
+}
+
+#[test]
+fn color_cluster_runs_through_run_command() {
+    let mut s = server();
+    let a = rectangle(&mut s, 1);
+    let b = tool(&mut s, 2, "draw_shape", json!({"shape": "ellipse", "x": 100, "y": 100, "width": 50, "height": 50}))["id"].as_i64().unwrap();
+    tool(&mut s, 3, "run_command", json!({"command": "select.set", "params": {"ids": [a, b]}}));
+    let v = tool(&mut s, 4, "run_command", json!({"command": "color.cluster", "params": {"maxDeltaE": 10}}));
+    assert!(v["clusters"].as_array().is_some_and(|c| !c.is_empty()), "missing clusters: {v}");
 }

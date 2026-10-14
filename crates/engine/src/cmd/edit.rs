@@ -33,7 +33,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Semantic Document Summary",
             [],
             None,
-            "{selection_only?: bool, max_palette_entries?: int} -> token-efficient summary",
+            "{selectionOnly?: bool (walk only the selected objects' subtrees), maxPalette?: int (default 32, max 256)} → {artboardCount, artboard: {width, height}|null (each null when not finite), backgroundCardId: id|null (bottom object of a top-level layer within 2% of the first artboard's size), totalNodes: visible objects counted, groupCount: visible groups incl. clip groups (not layers), loosePathCount: visible paths not inside any group or other non-layer container, hiddenCount: hidden objects/layers (their subtrees are skipped), depthCapped: bool (tree deeper than 512 levels was not walked below that), palette: [{hex, count, sampleIds: up to 5 ids}] most used first, ties by hex}; the whole tree is walked",
             has_doc,
             doc_semantic_summary
         ),
@@ -238,7 +238,8 @@ pub(crate) fn roots_of(doc: &Document, ids: Vec<NodeId>) -> Vec<NodeId> {
             _ => id,
         })
         .collect();
-    sel.dedup();
+    let mut seen = std::collections::HashSet::with_capacity(sel.len());
+    sel.retain(|id| seen.insert(*id));
     sel.iter()
         .copied()
         .filter(|id| {

@@ -2,29 +2,55 @@
 
 use serde_json::{Value, json};
 
+pub(crate) const MAX_LEGACY_DEPTH: usize = 64;
+
 /// Rewrite every anchor in a serialized document (`anchors` arrays of path data) the way format v1
 /// wrote it: `{p: {x, y}, in: {x, y}, out: {x, y}, kind}`, every member present (v1 readers need
 /// them all; v2 writes `{p: [x, y], in?, out?, kind?}`).
 pub(crate) fn anchors_to_v1(v: &mut Value) {
+    anchors_to_v1_depth(v, 0);
+}
+
+fn anchors_to_v1_depth(v: &mut Value, depth: usize) {
+    if depth >= MAX_LEGACY_DEPTH {
+        return;
+    }
     match v {
         Value::Object(o) => {
             for (k, x) in o.iter_mut() {
                 match x {
                     Value::Array(anchors) if k == "anchors" => anchors.iter_mut().for_each(anchor_to_v1),
-                    _ => anchors_to_v1(x),
+                    _ => anchors_to_v1_depth(x, depth + 1),
                 }
             }
         }
-        Value::Array(a) => a.iter_mut().for_each(anchors_to_v1),
+        Value::Array(a) => {
+            for x in a.iter_mut() {
+                anchors_to_v1_depth(x, depth + 1);
+            }
+        }
         _ => {}
     }
 }
 
+pub(crate) fn point(v: &Value) -> Option<Value> {
+    if let Some([x, y]) = v.as_array().map(Vec::as_slice)
+        && x.is_number()
+        && y.is_number()
+    {
+        let x = x.as_f64()?;
+        let y = y.as_f64()?;
+        return Some(json!({ "x": x, "y": y }));
+    }
+    if v.get("x").is_some_and(Value::is_number) && v.get("y").is_some_and(Value::is_number) {
+        let x = v.get("x")?.as_f64()?;
+        let y = v.get("y")?.as_f64()?;
+        return Some(json!({ "x": x, "y": y }));
+    }
+    None
+}
+
 fn anchor_to_v1(a: &mut Value) {
-    let point = |v: &Value| match v.as_array().map(Vec::as_slice) {
-        Some([x, y]) => Some(json!({ "x": x, "y": y })),
-        _ => None,
-    };
     let Some(o) = a.as_object() else { return };
     // Not a v2 anchor (already a map, or something else called `anchors`): leave it alone.
     let Some(p) = o.get("p").and_then(point) else { return };
@@ -45,5 +71,30 @@ mod tests {
         assert_eq!(a[0], json!({"p": {"x": 1.0, "y": 2.0}, "in": {"x": 1.0, "y": 2.0}, "out": {"x": 1.0, "y": 2.0}, "kind": "Corner"}));
         assert_eq!(a[1], json!({"p": {"x": 3.0, "y": 4.0}, "in": {"x": 3.0, "y": 4.0}, "out": {"x": 5.0, "y": 4.0}, "kind": "Smooth"}));
         assert_eq!(v["effect"]["anchors"], json!(true));
+    }
+
+    #[test]
+    fn point_validation() {
+        assert_eq!(point(&json!([1.5, 2.5])), Some(json!({"x": 1.5, "y": 2.5})));
+        assert_eq!(point(&json!({"x": 3.0, "y": 4.0})), Some(json!({"x": 3.0, "y": 4.0})));
+        assert_eq!(point(&json!([1.0])), None);
+        assert_eq!(point(&json!(["a", 2.0])), None);
+        assert_eq!(point(&json!({"x": "a", "y": 2.0})), None);
+        assert_eq!(point(&json!({"x": 1.0})), None);
+    }
+
+    #[test]
+    fn recursion_depth_limit() {
+        let mut deep = json!({"anchors": [{"p": [1.0, 2.0]}]});
+        for _ in 0..70 {
+            deep = json!({"nested": deep});
+        }
+        anchors_to_v1(&mut deep);
+        // The deep anchor shouldn't be touched because it exceeds MAX_LEGACY_DEPTH
+        let mut curr = &deep;
+        for _ in 0..70 {
+            curr = &curr["nested"];
+        }
+        assert_eq!(curr["anchors"][0]["p"], json!([1.0, 2.0]));
     }
 }

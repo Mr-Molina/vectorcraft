@@ -184,8 +184,10 @@ pub(crate) struct Converter {
     /// Entity types left out, with how many.
     pub skipped: BTreeMap<String, usize>,
     pub warnings: Vec<String>,
+    pub total_entities: usize,
 }
 
+const MAX_EXPANDED_ENTITIES: usize = 100_000;
 const PATTERN_HATCH: &str = "pattern hatches come in as their boundaries";
 const GRADIENT_HATCH: &str = "gradient hatches are filled with their first colour";
 const MESHES: &str = "3D polygon meshes and polyface meshes are left out";
@@ -207,12 +209,15 @@ impl Converter {
     pub fn items(&mut self, records: &[Record<'_>]) -> Vec<Item> {
         let mut out = Vec::new();
         for group in groups(records) {
+            if self.total_entities >= MAX_EXPANDED_ENTITIES {
+                break;
+            }
             let Some(head) = group.first() else { continue };
             // Invisible entities.
             if head.g.int(60) == Some(1) {
                 continue;
             }
-            match self.geom(head, group) {
+            match self.convert_entity(head, group) {
                 Some(geom) if !in_range(&geom) => self.warn(FAR_AWAY),
                 Some(geom) => out.push(Item { props: Props::read(head.g), geom }),
                 None if is_known(head.kind) => {}
@@ -220,6 +225,14 @@ impl Converter {
             }
         }
         out
+    }
+
+    pub fn convert_entity(&mut self, head: &Record<'_>, group: &[Record<'_>]) -> Option<Geom> {
+        if self.total_entities >= MAX_EXPANDED_ENTITIES {
+            return None;
+        }
+        self.total_entities += 1;
+        self.geom(head, group)
     }
 
     fn geom(&mut self, head: &Record<'_>, group: &[Record<'_>]) -> Option<Geom> {
@@ -280,6 +293,9 @@ impl Converter {
     }
 
     fn insert(&mut self, g: &[Pair<'_>], rest: &[Record<'_>]) -> Option<Geom> {
+        if self.total_entities >= MAX_EXPANDED_ENTITIES {
+            return None;
+        }
         let block = g.name(2)?.to_uppercase();
         let (sx, sy) = (g.num_or(41, 1.0), g.num_or(42, 1.0));
         if sx.abs() < 1e-12 || sy.abs() < 1e-12 {
@@ -294,10 +310,18 @@ impl Converter {
         } else {
             (cols, rows)
         };
-        let cells = (0..rows)
+        let max_remaining = MAX_EXPANDED_ENTITIES.saturating_sub(self.total_entities);
+        if max_remaining == 0 {
+            return None;
+        }
+        let total_cells = cols.saturating_mul(rows) as usize;
+        let count = total_cells.min(max_remaining);
+        let cells: Vec<Affine> = (0..rows)
             .flat_map(|r| (0..cols).map(move |c| (r, c)))
             .map(|(r, c)| place * Affine::translate((c as f64 * cs, r as f64 * rs)) * Affine::scale_non_uniform(sx, sy))
+            .take(count)
             .collect();
+        self.total_entities = self.total_entities.saturating_add(cells.len());
         let attribs = self.items(rest);
         Some(Geom::Insert(InsertItem { block, cells, attribs }))
     }
@@ -334,7 +358,7 @@ fn in_range(g: &Geom) -> bool {
         Geom::Path { bp, width, .. } => {
             curve::bounds(bp).is_some_and(|b| near(Point::new(b.x0, b.y0)) && near(Point::new(b.x1, b.y1))) && *width <= MAX_COORD
         }
-        Geom::Text(t) => origin(&t.xf) && t.height <= MAX_COORD,
+        Geom::Text(t) => origin(&t.xf) && t.xf.as_coeffs().iter().all(|v| v.is_finite()) && t.height.is_finite() && t.height <= MAX_COORD,
         Geom::Insert(i) => i.cells.iter().all(|m| origin(m) && m.as_coeffs().iter().all(|v| v.is_finite() && v.abs() <= MAX_COORD)),
     }
 }
@@ -400,7 +424,7 @@ fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
 
 fn unit(v: [f64; 3]) -> [f64; 3] {
     let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-    if len > 1e-12 { v.map(|x| x / len) } else { v }
+    if len.is_finite() && len > 1e-12 { v.map(|x| x / len) } else { v }
 }
 
 /// A planar entity's coordinate system seen from above: its x and y axes in world space by the
@@ -438,8 +462,18 @@ fn lwpolyline(g: &[Pair<'_>]) -> Option<Geom> {
     for p in g {
         match p.code {
             10 => verts.push(Vertex { p: Point::new(number(p.value)?, 0.0), bulge: 0.0 }),
-            20 => verts.last_mut()?.p.y = number(p.value)?,
-            42 => verts.last_mut()?.bulge = number(p.value).unwrap_or(0.0),
+            20 => {
+                if let Some(last) = verts.last_mut()
+                    && let Some(y) = number(p.value)
+                {
+                    last.p.y = y;
+                }
+            }
+            42 => {
+                if let Some(last) = verts.last_mut() {
+                    last.bulge = number(p.value).unwrap_or(0.0);
+                }
+            }
             40 | 41 => {
                 let w = number(p.value).unwrap_or(0.0);
                 uniform &= widths.is_none_or(|x: f64| (x - w).abs() < 1e-12);
@@ -688,7 +722,8 @@ fn mtext(g: &[Pair<'_>]) -> Option<TextItem> {
         _ => (lines - 1.0) * leading,
     };
     let direction = g.point_opt(11).map(|p| p.to_vec2()).filter(|d| d.hypot() > 1e-12);
-    let angle = direction.map_or_else(|| g.num_or(50, 0.0), |d| d.atan2());
+    let angle_from_50 = g.num_or(50, 0.0).to_radians();
+    let angle = direction.map_or(angle_from_50, |d| d.atan2());
     let xf = Affine::translate(g.point(10).to_vec2()) * Affine::rotate(angle) * Affine::translate((0.0, first));
     Some(TextItem {
         text: s,

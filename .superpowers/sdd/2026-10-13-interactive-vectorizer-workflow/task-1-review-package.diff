@@ -1,0 +1,183 @@
+ba84e604 feat(doc): add TraceView enum, node accessors, and crate re-export
+ crates/doc/src/lib.rs  |  2 +-
+ crates/doc/src/node.rs | 94 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 95 insertions(+), 1 deletion(-)
+diff --git a/crates/doc/src/lib.rs b/crates/doc/src/lib.rs
+index e3b54a84..048f201f 100644
+--- a/crates/doc/src/lib.rs
++++ b/crates/doc/src/lib.rs
+@@ -62,21 +62,21 @@ pub use appearance::{
+ pub use assets::ExportAsset;
+ pub use corners::LiveCorners;
+ pub use graph::{GraphKind, GraphSpec};
+ pub use hit::{Hit, HitKind};
+ pub use links::{LinkInfo, PlacementOptions};
+ pub use live::{BlendOrientation, BlendSpacing, BlendSpec, EnvelopeKind, GradientMesh, MeshPoint};
+ pub use metadata::{CopyrightStatus, DocMetadata};
+ pub use node::Knockout;
+ pub use node::Scaling;
+ pub use node::{ImageMap, ObjectAttributes};
+-pub use node::{ImageObject, LAYER_COLORS, LayerColor, LiveShape, Node, NodeId, NodeKind, OpacityMask};
++pub use node::{ImageObject, LAYER_COLORS, LayerColor, LiveShape, Node, NodeId, NodeKind, OpacityMask, TraceView};
+ pub use orient::OrientedBox;
+ pub use pattern::{Overlap, PatternDef, PatternEdit, RepeatKind, RepeatSpec, TileType};
+ pub use perspective::PerspectiveAttachment;
+ pub use placed_document::PlacedDocument;
+ pub use profiles::ColorProfiles;
+ pub use puppet::{PuppetPin, PuppetPins};
+ pub use rastersettings::{RasterColorModel, RasterEffectsSettings};
+ pub use selection::{AnchorRef, Selection};
+ pub use setup::{Background, DocSetup, ExportText, GridSize, Quotes};
+ pub use slices::{CellAlign, CellVAlign, Slice, SliceArea, SliceKind, SliceOptions, SliceSource};
+diff --git a/crates/doc/src/node.rs b/crates/doc/src/node.rs
+index 13ff5298..1e90572b 100644
+--- a/crates/doc/src/node.rs
++++ b/crates/doc/src/node.rs
+@@ -512,20 +512,42 @@ pub struct OpacityMask {
+     #[serde(default = "yes")]
+     pub linked: bool,
+ }
+ 
+ impl OpacityMask {
+     pub fn new(art: Node, clip: bool) -> Self {
+         Self { art: Arc::new(art), clip, invert: false, disabled: false, linked: true }
+     }
+ }
+ 
++/// The display mode of an Image Trace group.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "camelCase")]
++pub enum TraceView {
++    /// Render vector paths with their filled appearances (default).
++    #[default]
++    #[serde(alias = "tracingResult", alias = "result")]
++    TracingResult,
++    /// Render filled vector paths with high-contrast contour outlines overlaid.
++    #[serde(alias = "tracingResultWithOutlines", alias = "resultWithOutlines")]
++    TracingResultWithOutlines,
++    /// Render 1px vector path outlines only (wireframe preview, no fill).
++    #[serde(alias = "outlines", alias = "outline")]
++    Outlines,
++    /// Render the source image with vector path outlines overlaid.
++    #[serde(alias = "outlinesWithSource", alias = "outlinesWithSourceImage")]
++    OutlinesWithSource,
++    /// Render only the original source image (suppressing vector paths).
++    #[serde(alias = "sourceImage", alias = "source")]
++    SourceImage,
++}
++
+ impl Node {
+     pub fn new(id: NodeId, kind: NodeKind) -> Self {
+         Self {
+             id,
+             name: None,
+             visible: true,
+             locked: false,
+             opacity: 1.0,
+             blend: BlendMode::Normal,
+             isolate: false,
+@@ -621,20 +643,35 @@ impl Node {
+     /// Full opacity, Normal blending, no isolation, knockout or opacity mask (the Layers panel
+     /// fills an object's target circle otherwise).
+     pub fn has_default_transparency(&self) -> bool {
+         self.opacity >= 1.0
+             && self.blend == BlendMode::Normal
+             && !self.isolate
+             && self.knockout == Knockout::Neutral
+             && !self.knockout_shape
+             && self.mask.is_none()
+     }
++    /// Extracts the active `TraceView` if this is an Image Trace group, defaulting to `TracingResult`.
++    pub fn trace_view(&self) -> TraceView {
++        self.trace.as_ref().and_then(|t| t.get("view")).and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default()
++    }
++    /// Sets or updates the active `TraceView` in this node's trace metadata.
++    pub fn set_trace_view(&mut self, view: TraceView) {
++        let mut obj = match self.trace.take() {
++            Some(b) if b.is_object() => *b,
++            _ => serde_json::json!({}),
++        };
++        if let (Some(map), Ok(v)) = (obj.as_object_mut(), serde_json::to_value(view)) {
++            map.insert("view".into(), v);
++        }
++        self.trace = Some(Box::new(obj));
++    }
+     /// Kind name as the Layers panel / Properties panel shows it.
+     pub fn kind_label(&self) -> &'static str {
+         match &self.kind {
+             NodeKind::Layer { .. } => "Layer",
+             NodeKind::Group { clip: true, .. } => "Clip Group",
+             NodeKind::Group { .. } => "Group",
+             NodeKind::Path { live: Some(l), .. } => l.label(),
+             NodeKind::Path { guide: true, .. } => "Guide",
+             NodeKind::Path { .. } => "Path",
+             NodeKind::Compound { .. } => "Compound Path",
+@@ -1538,11 +1575,68 @@ mod tests {
+         let l = Node::layer(NodeId(1), "Layer 1", LayerColor::Preset(0));
+         assert_eq!(l.display_name(), "Layer 1");
+     }
+ 
+     #[test]
+     fn visual_bounds_include_stroke() {
+         let mut p = Node::path(NodeId(2), shapes::rectangle(Rect::new(0.0, 0.0, 10.0, 10.0)), Appearance::default_art());
+         p.appearance.stroke_mut().unwrap().join = crate::appearance::LineJoin::Round;
+         assert_eq!(p.visual_bounds(), Some(Rect::new(-0.5, -0.5, 10.5, 10.5)));
+     }
++
++    #[test]
++    fn test_trace_view_serialization_and_fallback() {
++        let mut n = Node::new(NodeId(1), NodeKind::Group { children: vec![], clip: false });
++        // 1. None defaults to TracingResult
++        assert_eq!(n.trace, None);
++        assert_eq!(n.trace_view(), TraceView::TracingResult);
++
++        // 2. Malformed JSON gracefully defaults to TracingResult
++        n.trace = Some(Box::new(serde_json::json!({ "view": "invalidVariant123" })));
++        assert_eq!(n.trace_view(), TraceView::TracingResult);
++
++        n.trace = Some(Box::new(serde_json::json!({ "view": 42 })));
++        assert_eq!(n.trace_view(), TraceView::TracingResult);
++
++        n.trace = Some(Box::new(serde_json::json!("not even an object")));
++        assert_eq!(n.trace_view(), TraceView::TracingResult);
++
++        // 3. Round-trip serialization/deserialization for all 5 variants
++        let variants = [
++            (TraceView::TracingResult, "\"tracingResult\""),
++            (TraceView::TracingResultWithOutlines, "\"tracingResultWithOutlines\""),
++            (TraceView::Outlines, "\"outlines\""),
++            (TraceView::OutlinesWithSource, "\"outlinesWithSource\""),
++            (TraceView::SourceImage, "\"sourceImage\""),
++        ];
++
++        for (variant, expected_json) in variants {
++            let serialized = serde_json::to_string(&variant).unwrap();
++            assert_eq!(serialized, expected_json);
++            let deserialized: TraceView = serde_json::from_str(&serialized).unwrap();
++            assert_eq!(deserialized, variant);
++
++            // Test set_trace_view and trace_view roundtrip
++            n.set_trace_view(variant);
++            assert_eq!(n.trace_view(), variant);
++        }
++
++        // 4. Test aliases
++        let aliases = [
++            ("\"result\"", TraceView::TracingResult),
++            ("\"tracingResult\"", TraceView::TracingResult),
++            ("\"resultWithOutlines\"", TraceView::TracingResultWithOutlines),
++            ("\"tracingResultWithOutlines\"", TraceView::TracingResultWithOutlines),
++            ("\"outline\"", TraceView::Outlines),
++            ("\"outlines\"", TraceView::Outlines),
++            ("\"outlinesWithSourceImage\"", TraceView::OutlinesWithSource),
++            ("\"outlinesWithSource\"", TraceView::OutlinesWithSource),
++            ("\"source\"", TraceView::SourceImage),
++            ("\"sourceImage\"", TraceView::SourceImage),
++        ];
++
++        for (json_str, expected_variant) in aliases {
++            let de: TraceView = serde_json::from_str(json_str).unwrap();
++            assert_eq!(de, expected_variant);
++        }
++    }
+ }

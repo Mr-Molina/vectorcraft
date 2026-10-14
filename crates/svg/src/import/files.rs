@@ -5,7 +5,7 @@
 //! can be relinked, and a warning.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Component, Path};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -42,6 +42,9 @@ pub(in crate::import) struct Linked {
 
 /// The side of the placeholder image, in pixels.
 const MARKER: u32 = 64;
+
+/// Maximum nesting depth for recursively imported SVG files.
+const MAX_SVG_NEST_DEPTH: usize = 8;
 
 /// The placeholder of a missing linked image: a light tile, crossed out (drawn here).
 fn marker() -> Option<Vec<u8>> {
@@ -100,8 +103,11 @@ fn target(h: &str, folder: Option<&str>) -> (String, bool) {
         None if h.contains("://") => return (h, false),
         None => h,
     };
-    if is_absolute(&path) {
-        return (path, true);
+    if path.contains('\0')
+        || is_absolute(&path)
+        || Path::new(&path).components().any(|c| matches!(c, Component::ParentDir | Component::RootDir | Component::Prefix(_)))
+    {
+        return (path, false);
     }
     match folder {
         Some(f) => (Path::new(f).join(&path).to_string_lossy().into_owned(), true),
@@ -160,6 +166,10 @@ impl Files {
             F::Gif => ImageKind::GIF,
             F::WebP => ImageKind::WEBP,
             _ => {
+                let (w, h) = image::ImageReader::new(std::io::Cursor::new(&bytes)).with_guessed_format().ok()?.into_dimensions().ok()?;
+                if w > 16384 || h > 16384 || (w as u64) * (h as u64) > 64_000_000 {
+                    return None;
+                }
                 let img = image::load_from_memory_with_format(&bytes, format).ok()?;
                 let mut png = Vec::new();
                 img.write_to(&mut std::io::Cursor::new(&mut png), F::Png).ok()?;
@@ -199,6 +209,10 @@ impl Files {
 
     /// usvg's image resolver: data URLs as usvg reads them, other hrefs only from the files read.
     pub(in crate::import) fn resolver(&self) -> ImageHrefResolver<'_> {
+        self.resolver_depth(0)
+    }
+
+    fn resolver_depth(&self, depth: usize) -> ImageHrefResolver<'_> {
         let data = ImageHrefResolver::default_data_resolver();
         ImageHrefResolver {
             resolve_data: Box::new(move |mime, bytes, opts| {
@@ -210,8 +224,17 @@ impl Files {
             resolve_string: Box::new(move |h, opts| match self.sources.get(h).or_else(|| self.sources.get(h.trim()))? {
                 Source::Raster(kind, bytes) => Some(kind(bytes.clone())),
                 Source::Svg(bytes) => {
+                    if depth >= MAX_SVG_NEST_DEPTH {
+                        return None;
+                    }
                     self.note_text(bytes);
-                    usvg::Tree::from_data_nested(bytes, opts).ok().map(ImageKind::SVG)
+                    let nested_opts = usvg::Options {
+                        dpi: opts.dpi,
+                        font_size: opts.font_size,
+                        image_href_resolver: self.resolver_depth(depth + 1),
+                        ..usvg::Options::default()
+                    };
+                    usvg::Tree::from_data_nested(bytes, &nested_opts).ok().map(ImageKind::SVG)
                 }
             }),
         }
@@ -227,9 +250,11 @@ mod tests {
         let sep = std::path::MAIN_SEPARATOR;
         assert_eq!(target("photo%20one.png", Some("/art")), (format!("/art{sep}photo one.png"), true));
         assert_eq!(target("photo.png", None), ("photo.png".into(), false));
-        assert_eq!(target("/abs/photo.png", Some("/art")), ("/abs/photo.png".into(), true));
-        assert_eq!(target("file:///C:/art/a.png", None), ("C:/art/a.png".into(), true));
-        assert_eq!(target("file:///home/a.png", None), ("/home/a.png".into(), true));
+        assert_eq!(target("/abs/photo.png", Some("/art")), ("/abs/photo.png".into(), false));
+        assert_eq!(target("file:///C:/art/a.png", None), ("C:/art/a.png".into(), false));
+        assert_eq!(target("file:///home/a.png", None), ("/home/a.png".into(), false));
+        assert_eq!(target("../secret.png", Some("/art")), ("../secret.png".into(), false));
+        assert_eq!(target("a\0b.png", Some("/art")), ("a\0b.png".into(), false));
         assert_eq!(target("https://example.com/a.png", Some("/art")), ("https://example.com/a.png".into(), false));
     }
 

@@ -8,7 +8,9 @@ use hayro_syntax::Filter;
 use hayro_syntax::object::stream::ImageDecodeParams;
 use hayro_syntax::object::{Array, Dict, Name, Stream};
 use vectorcraft_doc::ImageBlob;
-use vectorcraft_doc::cmyk::{Inks, MAX_CMYK_PIXELS, jpeg_components};
+#[cfg(not(target_arch = "wasm32"))]
+use vectorcraft_doc::cmyk::MAX_CMYK_PIXELS;
+use vectorcraft_doc::cmyk::{Inks, jpeg_components};
 
 /// A CMYK image read as RGB: why.
 pub(crate) const MASKED: &str = "CMYK images with a mask were imported in RGB";
@@ -72,8 +74,13 @@ pub(crate) fn cmyk(st: &Stream<'_>, width: u32, height: u32) -> Result<Option<Im
     if !matches!(bpc, 8 | 16) {
         return Err(UNREAD);
     }
+    #[cfg(target_arch = "wasm32")]
+    const MAX_PIXELS: u64 = 16_777_216;
+    #[cfg(not(target_arch = "wasm32"))]
+    const MAX_PIXELS: u64 = MAX_CMYK_PIXELS;
+
     let n = width as u64 * height as u64;
-    if n == 0 || n > MAX_CMYK_PIXELS {
+    if n == 0 || n > MAX_PIXELS {
         return Err(UNREAD);
     }
     let size = usize::from(bpc / 8);

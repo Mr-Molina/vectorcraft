@@ -166,7 +166,7 @@ objects' fills or strokes differ (`fillMixed` / `strokeMixed`, drawn as a "?" pr
 |---|---|---|
 | `list_commands` | `{filter?, enabledOnly?}` | The command catalogue: id, label, menu, shortcut, params doc, enablement. |
 | `run_command` | `{command, params?}` | Runs any command. Use it for everything without a dedicated tool. |
-| `inspect_document` | `{depth?, childLimit?}` | Artboards, layer tree (ids, kinds, bounds, paint), selection, history, tool. A type node's `fill`, `stroke` and `strokeWidth` are the paint its characters show (its first run's); fills and strokes of the type object itself come as `objectFill`, `objectStroke` and `objectStrokeWidth`. Paint comes as a label (`"#ff0000"`, `"None"`, `"G1 40% (#ff9999)"` for a swatch at a tint); `paint.proxies` gives it as an object. |
+| `inspect_document` | `{depth?, childLimit?, summary?, selectionOnly?, maxPalette?}` | Artboards, layer tree (ids, kinds, bounds, paint), selection, history, tool. A type node's `fill`, `stroke` and `strokeWidth` are the paint its characters show (its first run's); fills and strokes of the type object itself come as `objectFill`, `objectStroke` and `objectStrokeWidth`. Paint comes as a label (`"#ff0000"`, `"None"`, `"G1 40% (#ff9999)"` for a swatch at a tint); `paint.proxies` gives it as an object. `summary: true` runs `document.semantic_summary` instead of the tree: `{artboardCount, artboard, backgroundCardId, totalNodes, groupCount, loosePathCount, hiddenCount, depthCapped, palette: [{hex, count, sampleIds}]}`, over the selection only with `selectionOnly`, at most `maxPalette` palette entries (default 32, at most 256). `depth`/`childLimit` apply to the tree only, `selectionOnly`/`maxPalette` to the summary only. |
 | `inspect_ui` | `{}` | UI state. Remote mode only. |
 | `select_tool` | `{tool}` | `selection`, `directSelection`, `pen`, `rectangle`, `ellipse`, `polygon`, `star`, `lineSegment`, … |
 | `pointer_gesture` | `{events:[{kind,x,y,mods?}], tool?, mods?}` | `kind` is one of `down`, `drag`, `up`, `move`, `doubleclick`. Events go through the same path as the mouse. |
@@ -177,7 +177,7 @@ objects' fills or strokes differ (`fillMixed` / `strokeMixed`, drawn as a "?" pr
 | `type_text` | `{text}` | Remote only. |
 | `invoke_menu` | `{command, params?}` | Invokes a menu item by command id. Includes UI commands such as `view.*` and `window.*` in remote mode. |
 | `open_panel` | `{panel}` | Remote only. `panel` is a panel id (`layers`, `swatches`, `colorGuide`, …, as `window.panel` takes) or its display label (`"Color Guide"`), in any case. |
-| `screenshot` | `{path?, scale?, artboard?, window?}` | Returns MCP image content (`image/png`, base64) plus a text block. Renders the artboard; `window:true` captures the app window (remote only). |
+| `screenshot` | `{path?, scale?, artboard?, window?, overlay?, ids?, ungroupedOnly?}` | Returns MCP image content (`image/png`, base64) plus a text block. Renders the artboard; `window:true` captures the app window (remote only). `overlay: true` runs `render.overlay` instead: the same render with each object's bounding box and a numbered badge of its id drawn on top, for all objects, `ids`, or (`ungroupedOnly`) only those not in a group; the text block adds `annotatedCount`. It can't be combined with `window`. `scale` must be positive. |
 | `open_file` | `{path}` | Opens any readable file as a new active document: `.vectorcraft`/`.drawcraft`, `.vctemplate`, `.svg`/`.svgz`, `.pdf`/`.ai`, `.ait`, `.eps`, `.dxf`, `.emf`, `.wmf`, PNG, JPEG, GIF, WebP, TIFF, BMP (an image opens as a document of its pixel size). Templates (`.vctemplate`, `.ait`) open as a new untitled document. PDF, `.ai` and SVG files saved with Preserve Editing reopen as the document they carry. The reply is `document.open`'s: its `warnings` say what didn't come in as it was (an EPS whose PostScript can't be read opens as its preview, and the warning names the PostScript error, the operator and the procedure). `run_command document.formats` lists the formats. |
 | `save_file` | `{path?}` | Runs `document.save`: the document's own file in its own format (native `.vectorcraft` unless it was opened from or saved as SVG, PDF or a restorable `.ai`; then `warnings` say what that format loses). A path's extension picks the format (`.vectorcraft`, `.vctemplate`, `.pdf`, `.svg`, `.svgz`, `.ai`: a PDF carrying the native document, which reopens editable). |
 | `export` | `{path?, format?, scale?, artboard?, range?, selection?, outlineText?, options?}` | `svg`, `svgz`, `pdf`, `eps`, `dxf`, `emf`, `wmf`, `png`, `jpg`, `webp`, `gif`, `png8` (an indexed `.png`), `tiff`, `bmp`, `tga`, `psd` (layered), `txt` (the document's text), `vectorcraft` or `template` (a native template). The tool's `format` enum and `document.formats` list them, generated from the engine's format table. When `format` is omitted, it comes from the path's extension. PDF writes one page per artboard: all of them, or `artboard` (0-based) / `range` (`"1-3, 5"`, 1-based); the other formats write one artboard. `options` carries more format options (e.g. `{"quality": 80}` for JPEG). `selection: true` exports the selected objects cropped to their bounds (the reply adds their `bounds`, and reports `format` and the encoder's `warnings` as a whole-document export does); `outlineText: true` writes SVG text as paths. Template layers are left out, live effects are kept, and exporting `vectorcraft` never changes the document's path. Without `path` the bytes come back as `dataBase64`. Both backends run the same `document.export` call. |
@@ -188,9 +188,6 @@ objects' fills or strokes differ (`fillMixed` / `strokeMixed`, drawn as a "?" pr
 | `create_graph` | `{type?, x, y, width, height, csv? \| series?, categories?, rows?}` | The nine Illustrator graph types: column, stacked column, bar, stacked bar, line, area, scatter, pie and radar. Edit later with `graph.setData` / `graph.setType` via `run_command`. |
 | `text_wrap` | `{ids?, offset?, invert?, release?}` | Area type below the objects (same layer) flows around them. |
 | `undo` / `redo` | `{}` | |
-| `semantic_summary` | `{selection_only?, max_palette_entries?}` | Token-efficient summary of the active document: artboards, canvas background card ID, total group and loose path counts, and dominant palette frequency. |
-| `cluster_colors` | `{max_delta_e, action, node_ids?}` | Groups or previews nodes clustered by perceptual color distance (CIEDE2000). Action `'preview'` returns proposed clusters without mutating; action `'group'` creates new named color groups atomically. |
-| `render_overlay` | `{path, scale?, node_ids?, ungrouped_only?}` | Exports an annotated PNG image displaying semi-transparent bounding boxes and high-contrast numbered badges for nodes. |
 
 With `mods.shift`, a marquee dragged with the Selection tool toggles the objects it reaches (the selected ones leave
 the selection, the others join it, the rest stays), and one dragged with Direct or Group Selection toggles the anchors
@@ -238,6 +235,17 @@ Guide panel shows: the harmony rule's colours, base first, and per colour its ro
 (shades, cool or muted on the left, tints, warm or vivid on the right). With `limitTo` (a swatch library id or name,
 or `"document"` for the document's swatches) every colour snaps to the library's nearest colour (ΔE 2000), as the
 panel's Limit to Library does (`ui.colorGuideLimit`); Recolor Artwork's `limitTo` takes the same values.
+
+Colour clustering has no tool of its own; it runs through `run_command`. `color.cluster {maxDeltaE, ids?}` (a
+query: nothing changes) groups the fills of the selection (or `ids`) whose colours lie within `maxDeltaE` of each
+other (CIEDE2000) and answers `{clusters: [{name, hex, ids, avgDeltaE}], skipped: [{id, reason}]}`;
+`edit.colors.groupByColor` takes the same params and groups each cluster's objects as one undo step, answering
+`{groups, clusters, skipped}`. Preview first, then group:
+
+```json
+{"name":"run_command","arguments":{"command":"color.cluster","params":{"maxDeltaE":10}}}
+{"name":"run_command","arguments":{"command":"edit.colors.groupByColor","params":{"maxDeltaE":10}}}
+```
 
 Color Themes (local only: no online service) keeps five-colour themes in the preferences. `colorTheme.save
 {colors: [...]}` saves up to five colours as they are, `colorTheme.save {color, rule}` saves the five-colour theme a

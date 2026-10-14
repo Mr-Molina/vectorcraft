@@ -7,8 +7,11 @@ use std::collections::HashMap;
 
 use vectorcraft_geom::Point;
 
-/// The most group-code pairs a drawing may hold (about 300 MB of DXF).
-const MAX_PAIRS: usize = 20_000_000;
+/// The most group-code pairs a drawing may hold (about 30 MB of DXF).
+#[cfg(target_arch = "wasm32")]
+const MAX_PAIRS: usize = 1_000_000;
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_PAIRS: usize = 2_000_000;
 
 /// The first bytes of a binary DXF file (its format's signature).
 pub const BINARY_SENTINEL: &[u8] = b"AutoCAD Binary DXF\r\n\x1a\x00";
@@ -349,17 +352,32 @@ pub(crate) fn groups<'r, 'a>(records: &'r [Record<'a>]) -> impl Iterator<Item = 
         let start = i;
         let head = records.get(start)?;
         i += 1;
-        if matches!(head.kind, "POLYLINE" | "INSERT") {
-            while let Some(r) = records.get(i) {
-                match r.kind {
-                    "VERTEX" | "ATTRIB" => i += 1,
-                    "SEQEND" => {
-                        i += 1;
-                        break;
+        match head.kind {
+            "POLYLINE" => {
+                while let Some(r) = records.get(i) {
+                    match r.kind {
+                        "VERTEX" => i += 1,
+                        "SEQEND" => {
+                            i += 1;
+                            break;
+                        }
+                        _ => break,
                     }
-                    _ => break,
                 }
             }
+            "INSERT" => {
+                while let Some(r) = records.get(i) {
+                    match r.kind {
+                        "ATTRIB" => i += 1,
+                        "SEQEND" => {
+                            i += 1;
+                            break;
+                        }
+                        _ => break,
+                    }
+                }
+            }
+            _ => {}
         }
         records.get(start..i)
     })

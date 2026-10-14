@@ -529,10 +529,18 @@ impl<'a> Interp<'a> {
             Mark | MarkBracket | DictBegin => self.push(Obj::Mark)?,
             CloseArray => {
                 let items = self.pop_to_mark()?;
+                if items.len() > MAX_ALLOC {
+                    return Err(PsError::Limit("an array grew too large"));
+                }
+                self.alloc(items.len())?;
                 self.push(Obj::array(items))?;
             }
             DictEnd => {
                 let items = self.pop_to_mark()?;
+                if items.len() > MAX_ALLOC {
+                    return Err(PsError::Limit("a dictionary grew too large"));
+                }
+                self.alloc(items.len())?;
                 let mut d = Dict::new();
                 for pair in items.chunks(2) {
                     let [k, v] = pair else { return ps_err("rangecheck", ">>") };
@@ -562,11 +570,15 @@ impl<'a> Interp<'a> {
                     None => {
                         let (x, y) =
                             (a.as_num().ok_or(PsError::Ps("typecheck", String::new()))?, b.as_num().ok_or(PsError::Ps("typecheck", String::new()))?);
-                        Obj::Real(match op {
+                        let val = match op {
                             Add => x + y,
                             Sub => x - y,
                             _ => x * y,
-                        })
+                        };
+                        if !val.is_finite() {
+                            return ps_err("limitcheck", "real overflow");
+                        }
+                        Obj::Real(val)
                     }
                 };
                 self.push(r)?;
@@ -601,6 +613,9 @@ impl<'a> Interp<'a> {
                     }
                     _ => {
                         let [num, den] = self.nums()?;
+                        if num == 0.0 && den == 0.0 {
+                            return ps_err("undefinedresult", "atan(0, 0)");
+                        }
                         num.atan2(den).to_degrees().rem_euclid(360.0)
                     }
                 };
@@ -686,9 +701,16 @@ impl<'a> Interp<'a> {
                 _ => return ps_err("typecheck", ""),
             },
             Bitshift => {
-                let (s, v) = (self.pop_int()?, self.pop_int()?);
-                let r = if s >= 0 { v.checked_shl(s.min(63) as u32) } else { v.checked_shr((-s).min(63) as u32) };
-                self.push(Obj::Int(r.unwrap_or(0)))?;
+                let (s, n) = (self.pop_int()?, self.pop_int()?);
+                let shift = s.unsigned_abs();
+                let r = if shift >= 64 {
+                    0
+                } else if s >= 0 {
+                    (n as u64).wrapping_shl(shift as u32) as i64
+                } else {
+                    ((n as u64) >> (shift as u32)) as i64
+                };
+                self.push(Obj::Int(r))?;
             }
             True => self.push(Obj::Bool(true))?,
             False => self.push(Obj::Bool(false))?,
@@ -766,7 +788,12 @@ impl<'a> Interp<'a> {
                 let depth = self.depth;
                 match self.call(p) {
                     Ok(()) => self.push(Obj::Bool(false))?,
-                    Err(PsError::Ps(..) | PsError::Stop | PsError::Exit) => {
+                    Err(PsError::Stop) => {
+                        self.depth = depth;
+                        self.fault = None;
+                        self.push(Obj::Bool(true))?;
+                    }
+                    Err(PsError::Ps(name, _)) if name != "limitcheck" => {
                         self.depth = depth;
                         self.fault = None;
                         self.push(Obj::Bool(true))?;
@@ -890,8 +917,11 @@ impl<'a> Interp<'a> {
                 let written = match c {
                     Obj::Array { items, .. } => items.write(index(&k)?, std::slice::from_ref(&v)),
                     Obj::Str(s) => {
-                        let b = v.as_num().ok_or(PsError::Ps("typecheck", String::new()))?;
-                        s.write(index(&k)?, &[b as i64 as u8])
+                        let b = match v {
+                            Obj::Int(n) if (0..=255).contains(&n) => n as u8,
+                            _ => return ps_err("rangecheck", "put"),
+                        };
+                        s.write(index(&k)?, &[b])
                     }
                     Obj::Dict(d) => {
                         let key = k.key().ok_or(PsError::Ps("typecheck", String::new()))?;
@@ -1351,7 +1381,10 @@ impl<'a> Interp<'a> {
 /// An array or string index.
 fn index(k: &Obj) -> Res<usize> {
     match *k {
-        Obj::Int(i) if i >= 0 => Ok(i as usize),
+        Obj::Int(i) => {
+            let idx = usize::try_from(i).map_err(|_| PsError::Ps("rangecheck", "an index".to_string()))?;
+            Ok(idx)
+        }
         _ => ps_err("rangecheck", "an index"),
     }
 }

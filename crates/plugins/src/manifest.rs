@@ -93,6 +93,9 @@ pub struct Manifest {
     pub description: String,
     #[serde(default)]
     pub author: String,
+    /// Optional entry path for plugin wasm/module (SEC-503).
+    #[serde(default)]
+    pub entry: Option<String>,
     /// Parameters in declaration (dialog) order; a JSON object `{"name": spec, …}` in the manifest.
     #[serde(default, deserialize_with = "ordered_params", serialize_with = "params_as_object")]
     pub params: Vec<(String, ParamSpec)>,
@@ -119,6 +122,7 @@ impl Manifest {
             kind: Kind::Filter,
             description: String::new(),
             author: String::new(),
+            entry: None,
             params: Vec::new(),
         }
     }
@@ -134,17 +138,29 @@ impl Manifest {
         if self.version.len() > 32 || self.description.len() > 1024 || self.author.len() > 128 {
             return Err(Error::Manifest("`version`, `description` or `author` is too long".into()));
         }
+        if let Some(entry) = &self.entry
+            && (entry.contains('\0')
+                || std::path::Path::new(entry)
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::RootDir | std::path::Component::Prefix(_))))
+        {
+            return Err(Error::Manifest(format!("manifest entry {entry:?} contains forbidden path components")));
+        }
         for (k, spec) in &self.params {
             if !valid_key(k) {
                 return Err(Error::Manifest(format!("invalid parameter name {k:?}")));
             }
             match spec {
                 ParamSpec::Number { min, max, default } => {
-                    if !(min.is_finite() && max.is_finite() && default.is_finite()) || min > max {
+                    if !(default.is_finite() && min.is_finite() && max.is_finite() && *default >= *min && *default <= *max) {
                         return Err(Error::Manifest(format!("parameter `{k}`: bad range")));
                     }
                 }
-                ParamSpec::Int { min, max, .. } if min > max => return Err(Error::Manifest(format!("parameter `{k}`: bad range"))),
+                ParamSpec::Int { min, max, default } => {
+                    if !(*default >= *min && *default <= *max) {
+                        return Err(Error::Manifest(format!("parameter `{k}`: bad range")));
+                    }
+                }
                 ParamSpec::Choice { options, default } => {
                     if options.is_empty()
                         || options.len() > 64
@@ -262,7 +278,12 @@ fn params_as_object<S: serde::Serializer>(p: &[(String, ParamSpec)], s: S) -> st
 
 /// `[A-Za-z0-9._-]{1,64}`.
 pub fn valid_id(id: &str) -> bool {
-    (1..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    (1..=64).contains(&id.len())
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        && !id.starts_with('.')
+        && !id.ends_with('.')
+        && !id.starts_with('-')
+        && !id.contains("..")
 }
 
 /// `[A-Za-z0-9_]{1,64}`, not starting with `_` and not a key the commands and dialogs use
@@ -313,10 +334,17 @@ mod tests {
             "not json",
             r#"{"id":"","name":"x","kind":"filter"}"#,
             r#"{"id":"a b","name":"x","kind":"filter"}"#,
+            r#"{"id":".bad","name":"x","kind":"filter"}"#,
+            r#"{"id":"bad.","name":"x","kind":"filter"}"#,
+            r#"{"id":"-bad","name":"x","kind":"filter"}"#,
+            r#"{"id":"a..b","name":"x","kind":"filter"}"#,
             r#"{"id":"a","name":"","kind":"filter"}"#,
             r#"{"id":"a","name":"x","kind":"panel"}"#,
             r#"{"id":"a","name":"x"}"#,
             r#"{"id":"a","name":"x","kind":"filter","params":{"r":{"type":"number","min":5,"max":1,"default":1}}}"#,
+            r#"{"id":"a","name":"x","kind":"filter","params":{"r":{"type":"number","min":0,"max":10,"default":20}}}"#,
+            r#"{"id":"a","name":"x","kind":"filter","params":{"i":{"type":"int","min":0,"max":10,"default":20}}}"#,
+            r#"{"id":"a","name":"x","kind":"filter","entry":"../etc/passwd"}"#,
             r#"{"id":"a","name":"x","kind":"filter","params":{"c":{"type":"choice","options":[]}}}"#,
             r#"{"id":"a","name":"x","kind":"filter","params":{"__x":{"type":"bool"}}}"#,
             r#"{"id":"a","name":"x","kind":"filter","params":{"preview":{"type":"bool"}}}"#,

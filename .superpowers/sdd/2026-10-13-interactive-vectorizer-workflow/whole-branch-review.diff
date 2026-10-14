@@ -1,0 +1,1020 @@
+diff --git a/ROADMAP.md b/ROADMAP.md
+index 6b11a1bd..d6f99173 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -86,11 +86,11 @@ When a task lands, update this section, the parity table and "Shipped so far" in
+ grade by behaviour against `plan/illustrator/`, not by whether a menu item exists.
+ 
+ ## Shipped so far
+-- **Architecture:** 19+ crates with enforced layering (`cargo xtask layers`). Every action is a command (~403 engine + ~50 UI). Undo is unlimited via structural sharing. `command.batch` runs several commands as one transaction.
++- **Architecture:** 19+ crates with enforced layering (`cargo xtask layers`). Every action is a command (~404 engine + ~50 UI). Undo is unlimited via structural sharing. `command.batch` runs several commands as one transaction.
+ - **Automation:**
+   - Actions panel (record/playback, persisted), generic parameter dialogs for every "…" command.
+   - JSON-lines control channel with real egui pointer and keyboard injection.
+-  - MCP server with 28 tools (drawing, text, effects, Pathfinder, transforms, graphs, text wrap, export, screenshots, any command, plus native agent tools: `semantic_summary`, `cluster_colors`, and `render_overlay`), attached to the running app or headless. Tool descriptions and replies agree with the engine: format lists come from its format table, `save_file` says it keeps the document's own format, `inspect_document` reports the paint type's characters show, and selection exports report the encoder's warnings.
++  - MCP server with 25 tools (drawing, text, effects, Pathfinder, transforms, graphs, text wrap, export, screenshots, any command), attached to the running app or headless. Agent aids are options on existing tools rather than extra tools: `inspect_document {summary: true}` returns a compact semantic summary (counts, artboard, palette by frequency) via `document.semantic_summary`, `screenshot {overlay: true}` draws numbered id badges and boxes via `render.overlay`, and `color.cluster` / `edit.colors.groupByColor` cluster fills by CIEDE2000 through `run_command`. Tool descriptions and replies agree with the engine: format lists come from its format table, `save_file` says it keeps the document's own format, `inspect_document` reports the paint type's characters show, and selection exports report the encoder's warnings.
+   - MCP protocol: five prompts (`prompts/list` / `prompts/get`: poster, icon set, recolour, trace-and-style, export set), `completion/complete` for prompt arguments and template variables read from the live catalogues (formats, effect ids, command ids, trace presets, swatch and object ids), four resource templates (`vectorcraft://object/{id}`, `//command/{id}`, `//effect/{id}`, `//swatch/{name}`) so an agent reads one thing instead of the whole document, and `logging/setLevel` with `notifications/message`. `window.panel` ids are case-insensitive (display labels work too), `vectorcraft://object/{id}` reads through `document.node {summary: true}` (the same reply bytes from one lookup instead of summarizing the whole document: a leaf read on a 2,000-object document drops from ~20 ms to ~0.06 ms), large containers slice with `document.node {depth?, childLimit?}` (truncated levels report `childCount`), `document.inspect` and the `inspect_document` tool slice the same way so a depth-0 read is the layer skeleton (~9.7 KB instead of ~2 MB on a 2,000-object document), `document.find` locates nodes by name/kind/text with ancestor paths, and the CLI sweeps the protocol surface over stdio against the compiled binary. `docs/mcp.md` has a Protocol section covering the capability table and what is deliberately absent (subscriptions, progress, cancellation, sampling, elicitation, Streamable HTTP — all of which need the transport to interleave reads).
+   - Headless CLI (`vectorcraft-cli run`, `convert`, `info`, `bench`, `perf`, `mcp`).
+   - Actions panel that records and plays back commands.
+@@ -141,7 +141,7 @@ grade by behaviour against `plan/illustrator/`, not by whether a menu item exist
+ - **Type:** Text Wrap, Type on a Path effects (Rainbow/Skew/3D Ribbon/Stair Step/Gravity) and Options (Flip, Align to Path, Spacing; OK keeps the type where it is), type on a path's start, centre and end brackets (Selection and Direct Selection drag them to set where the type runs, slide it along its path and, across the path, flip it: #429), Character and Paragraph Styles (override-preserving redefine), Area Type Options (rows/columns/inset/first baseline), threaded text across any closed shapes, Fit Headline. Area type resizes like Illustrator's type areas: a bounding-box handle drag (Selection tool) or Area Type Options Width/Height size the frame and the text reflows at its size (threads too); Direct Selection drags a frame corner or edge (`text.reshapeArea`). Point type still scales. The Selection tool shows the type widget beside selected type's bounding box (hollow on point type, filled on area type); double-clicking it converts between them (Type › Convert To Area Type / Convert To Point Type), keeping the text and its styles in place. Variable fonts list every named instance as a style of their family (Figtree Light to Black and their italics, Bahnschrift, Segoe UI Variable), and the instance chosen is shaped, drawn, outlined and measured at its axis settings; PDF and SVG embed it as that instance. Variation axis sliders are not done. Hebrew and Arabic are laid out right to left with the Unicode bidirectional algorithm (embedded Latin and numbers keep their direction, lines put in visual order after wrapping) in point, area and path type, with caret, selection and arrow keys in visual order; each paragraph's direction comes from its first strong character unless Paragraph Direction sets it (Paragraph panel with Show Indic Options, `text.setFormat {direction}`), and new type aligns to the start of its direction. SVG export outlines right-to-left text. Font Size and Leading are combo boxes in the Character and Properties panels (Font Size in the Control bar too, beside the Character link, font family and style): type, step with ↑/↓ or the spinner, scrub the label, or pick a preset (6–72 pt, shown in the type unit; Leading also Auto), each pick one undo step; Kerning and Tracking list -100…200; a size, leading, kerning or tracking the selected text doesn't share shows blank (#458).
+ - **Interface languages, vertical type:** VectorCraft ▸ Language (or Preferences ▸ User Interface) picks Automatic (the system locale) or a registered language, persisted as `interfaceLanguage`. Translations come from per-language catalogs (`i18n/*.tsv`): Traditional and Simplified Chinese, Japanese, Spanish (neutral international Spanish, for every `es-*` locale) and Italian (every `it-*` locale) cover the whole interface, Czech and Brazilian Portuguese every menu label, Brazilian Portuguese the shell's `tl!` literals too (tested); Spanish and Italian also translate status-bar and error messages as they are shown (`@msg` templates, every message literal tested; the messages themselves stay English for agents); untranslated text stays English. Japanese and Chinese glyphs come from the craft-fonts build input (release builds) or the installed fonts, Czech, Spanish and Italian ones from the bundled UI fonts. The web app follows the browser's languages (or `?lang=`). The Basic toolbar's Type button holds Vertical Type in its flyout. Vertical Type, Vertical Area Type and Vertical Type on a Path create vertical text (columns right to left, upright CJK glyphs and marks with `vert` alternates, Latin and longer numbers on their side, two- and three-digit numbers set as tate-chu-yoko in one em of the column (kept whole when justified), upright glyphs centred on the column (tracked or justified too), point type's anchor on the first column's centre line); kinsoku (the strict set) applies to horizontal and vertical Japanese, and justified Japanese lines spread their room between characters (not inside Latin words); Paragraph panel › Mojikumi Set (shown with Preferences › Type › Show East Asian Options, `text.setFormat {mojikumi}`): None or Line-end Punctuation Half Width (new type's default, as in Illustrator; older documents and imported text keep None) shares one half-em space between consecutive punctuation, sets a closing mark ending a line half width and an opening bracket starting a wrapped line flush with its start, and puts a quarter em between Japanese and Latin letters or digits; Paragraph panel menu › Top-to-Top / Bottom-to-Bottom Leading measures leading from em box top to top (area type's first line touches the frame) or from baseline to baseline (new type in a Japanese interface starts top to top, with em box centre character alignment, #432); Paragraph panel menu › Burasagari None / Regular / Force (`text.setFormat {burasagari: "none"|"standard"|"forced"}`) hangs an East Asian comma or full stop (、。，．､｡) ending an area type line outside it, Regular (new type's default) when it doesn't fit and Force always (the rest of the line then fills the measure; closing brackets and Latin punctuation don't hang); Character panel menu › Character Alignment (with the East Asian options; `text.setFormat` or `text.setRangeStyle {charAlign}`) lines characters smaller than the largest on their line up on the Roman baseline or the em box top/right, centre or bottom/left (ICF top and bottom not yet); Type ▸ Type Orientation switches existing text; caret, selection, hit testing and arrow keys follow the writing direction. Vertical text exports to PDF as real text and to SVG as outlines.
+ - **Transparency:** opacity masks (clip/invert/disable/link), exported as SVG `<mask>` and PDF soft masks.
+-- **Advanced art:** live Blends (steps/distance/smooth colour, editable spine, anchor-targeted Blend tool, faithful interpolation, knockout), Envelope Distort (warp/mesh/top object, Reset, full Envelope Options, mesh handles, Edit Contents; type, images, symbols, gradients, patterns and appearance distorted everywhere), Liquify tools with options and pen pressure, Puppet Warp with rotating pins, Perspective Grid with presets, movable planes and projected type (choosing a perspective tool shows the grid; Hide Grid hides it with the tool still chosen), Gradient Mesh, Shape Builder (stroke-only open paths and lines cut the regions they cross and enclose regions of their own; filled open paths count as closed; erase mode while Alt/Option is held: a minus pointer, red highlights of what will go, a click or drag deletes the regions touched, the pieces of open lines and the edges (outline pieces between the points where paths meet, opening their paths there) it passes over, one undo step, `shapeBuilder.merge {erase}` and `shapeBuilder.regions` edges over MCP), Live Paint (every path an edge, open lines included), Image Trace (12 presets, colour layers traced in parallel; a trace past two million anchor points or an image over 64 megapixels is refused with advice rather than running out of memory, and a selection too large to outline shows its bounds (#525); Object › Image Trace › Make and Make and Expand trace at once with the Default preset, #543; with an image selected the Control bar and the Properties panel show Image Trace, whose arrow traces with any preset, Mask (`object.maskImage`: a clipping path on the image's outline, selected so its handles crop), Crop Image and Embed or Unembed in place of Fill and Stroke; with an Image Trace object selected, its Preset (choosing another traces again), the Image Trace panel and Expand, plus Release in Properties; the View modes are not done), pattern swatches with pattern editing mode, live Repeat (radial/grid/mirror).
++- **Advanced art:** live Blends (steps/distance/smooth colour, editable spine, anchor-targeted Blend tool, faithful interpolation, knockout), Envelope Distort (warp/mesh/top object, Reset, full Envelope Options, mesh handles, Edit Contents; type, images, symbols, gradients, patterns and appearance distorted everywhere), Liquify tools with options and pen pressure, Puppet Warp with rotating pins, Perspective Grid with presets, movable planes and projected type (choosing a perspective tool shows the grid; Hide Grid hides it with the tool still chosen), Gradient Mesh, Shape Builder (stroke-only open paths and lines cut the regions they cross and enclose regions of their own; filled open paths count as closed; erase mode while Alt/Option is held: a minus pointer, red highlights of what will go, a click or drag deletes the regions touched, the pieces of open lines and the edges (outline pieces between the points where paths meet, opening their paths there) it passes over, one undo step, `shapeBuilder.merge {erase}` and `shapeBuilder.regions` edges over MCP), Live Paint (every path an edge, open lines included), Image Trace (12 presets, colour layers traced in parallel; a trace past two million anchor points or an image over 64 megapixels is refused with advice rather than running out of memory, and a selection too large to outline shows its bounds (#525); Object › Image Trace › Make and Make and Expand trace at once with the Default preset, #543; with an image selected the Control bar and the Properties panel show Image Trace, whose arrow traces with any preset, Mask (`object.maskImage`: a clipping path on the image's outline, selected so its handles crop), Crop Image and Embed or Unembed in place of Fill and Stroke; with an Image Trace object selected, its Preset (choosing another traces again), the Image Trace panel and Expand, plus Release in Properties; 5 interactive View modes: Tracing Result, Tracing Result with Outlines, Outlines, Outlines with Source Image, and Source Image, with live debounced dragging and eye inspection toggle), pattern swatches with pattern editing mode, live Repeat (radial/grid/mirror).
+ - **Paint and appearance (M3):**
+   - **Swatches:** names follow the colour model and are unique; Swatch Options (process/spot, Global, Gray/RGB/HSB/CMYK/Web, live preview); editing a global or spot swatch recolours every linked fill, stroke and text run in one undo step; multi-select and delete with confirmation; New Swatch and New Color Group dialogs (a group from the selected artwork's colours); swatches in colour groups convert, separate and count like any other. The Swatches panel selects ranges and whole groups, has a find field, and drags swatches to reorder, regroup or paint art; Add Used Colors, Select All Unused, Merge, Ungroup and Sort by Kind; a CMYK document keeps applied colours in CMYK. Swatch libraries: nine generated colour libraries and five gradient libraries in a library panel, saved and loaded as `.vcswatches`, `.gpl` or CSS. Tints of global and spot colours ("Name 40%") stay linked and separate as a percentage of their plate. Spot colours can be defined in Lab (Spot Colors options). A built-in [Registration] swatch prints on every plate.
+   - **Colour:** a Color Picker (colour field, H/S/B/R/G/B channel slider, HSB/RGB/Lab/CMYK fields, hex, web-only snapping, out-of-gamut correction); the Color panel follows each colour's own model and Alt-click paints the other proxy; proxies look through groups and show "?" for mixed paint; Invert, Complement, Apply Last Color (`,`) and Apply Last Gradient (`.`) keep the colour model; every paint command feeds the recent colours. The Color Guide has 21 harmony rules, Steps and Variation options and Limit to Library. Adjust Color Balance (its Global mode shifts tints) and Saturate preview live; Edit Colors and Recolor also reach meshes, images and patterns. Recolor Artwork has colour reduction, five recolour methods, presets, Limit to Library, a colour-wheel Edit tab and Edit Color Group; a local Color Themes panel saves five-colour themes. Fill/Stroke chips open swatch and mixer popovers (the Properties panel has the Control bar's Fill and Stroke chips, Stroke link and weight spinner, with nothing selected too), panels have Illustrator's Window menu keys (Align Shift+F7, Transform Shift+F8, Pathfinder Cmd+Shift+F9, Layers F7, Character Cmd+T…; every panel can be given one in Edit › Keyboard Shortcuts), and Eyedropper Options pick up and apply chosen attributes (Alt and Shift+Alt, image pixels). Fills and strokes can overprint (Attributes panel, Overprint Black options), and CMYK documents blend in inks on screen, in PDF and when flattening. Document Color Mode converts the art, symbols, pattern tiles and swatches through the colour settings: Gray stays Gray, RGB greys separate into four-colour greys and a rich black as Illustrator does, or go on the black plate only with `grays: "black"` (also for `document.open {colorMode}`).
+@@ -180,7 +180,7 @@ grade by behaviour against `plan/illustrator/`, not by whether a menu item exist
+ | M9 | Live effects (+ 3D & Materials) | 🟡 2D effects done incl. Effect → Pathfinder and Color Adjustments; SVG Filters, Document Raster Effects Settings, 3D pending | 86–135 |
+ | M10 | Brushes, symbols, patterns, Repeat | 🟡 pattern swatches (5 tile types, Pattern Options, editing mode, SVG `<pattern>`/PDF export) and live Repeat (radial/grid/mirror) done; brushes/symbols in progress | 23–37 |
+ | M11 | Artboards & views (artboard panel/tool, Trim View, middle-button pan, print tiling and the status bar's artboard navigator done; multiple windows, presentation polish) | 🟡 | 15–25 |
+-| M12 | Advanced color & art (CMYK/ICC, separations, Gradient Mesh, Live Paint, Image Trace, Graphs) | 🟡 Gradient Mesh, Live Paint, Image Trace (12 presets, 18 ms/1k² image), Recolor Artwork, colour management (ICC, soft proofing, separations preview), Graphs (all 9 tools, Graph Data/Type, regenerate in place) done; graph Design/Column/Marker designs pending | 6–10 |
++| M12 | Advanced color & art (CMYK/ICC, separations, Gradient Mesh, Live Paint, Image Trace, Graphs) | 🟡 Gradient Mesh, Live Paint, Image Trace (12 presets, 18 ms/1k² image, 5 interactive View modes & live drag coalescing), Recolor Artwork, colour management (ICC, soft proofing, separations preview), Graphs (all 9 tools, Graph Data/Type, regenerate in place) done; graph Design/Column/Marker designs pending | 5–8 |
+ | M13 | Automation (Actions ✅ record/playback, persisted; variables, scripting, batch) | 🟡 | 18–27 |
+ | M14 | 1.0 polish (preferences, shortcut editor, workspaces, accessibility, packaging for all OSes) | 🟡 Preferences, shortcut editor (chords with Shift and a punctuation key fire as typed), workspaces, a custom title bar on Windows/Linux with a Home button, content-sized dialogs and menus that scroll when longer than the window done; an experimental, unsupported Windows 7 x64 portable OpenGL build (not verified by maintainers); accessibility and broader Windows/Linux packaging/QA pending | 18–28 |
+ | — | Interaction fidelity pass (every tool's modifiers, Properties panel per context, isolation, nuance) | ⬜ | 60–90 |
+@@ -213,7 +213,7 @@ about 1–1.5 agent-hours each, so the other rows (estimated on the older scale)
+ | Type core | 9 | 79% | Middle Eastern features beyond bidi layout and Paragraph Direction (Character Direction, digit types, kashidas, the Middle Eastern composers, editable bidirectional SVG text, a split caret where directions meet); composer/hyphenation options, Optical Margin Alignment, hidden characters, Transform Again after a type-area resize (it scales the type), partial selection of type-area anchors by marquee | 15–20 |
+ | Type advanced | 4 | 50% | CJK composition for vertical type (ruby, mojikumi beyond Line-end Punctuation Half Width — the other sets (and their paragraph-start bracket and indent rules), kinsoku sets and the Mojikumi Settings dialog —, proportional vertical metrics, manual tate-chu-yoko, Character Alignment on the ICF top and bottom), variable font axis sliders (named instances are styles), tab leaders, spell check (open dictionary), Touch Type, Retype; vertical point/area/path type and Type Orientation have initial support | 20–28 |
+ | Symbols, blends, envelopes, Repeat, perspective | 5 | 88% | symbol libraries (original), dynamic symbols, envelope Anti-Alias/Preserve Shape output and warp point editing, brush interpolation in blends (M8 fidelity pass done) | 5–8 |
+-| Image Trace, graphs, image tools | 3 | 70% | graph Design/Column/Marker, Create Object Mosaic, Crop Image polish (an on-canvas crop box), Image Trace View modes (Outlines, Source Image) (Vector Halftone is done) | 6–10 |
++| Image Trace, graphs, image tools | 3 | 76% | graph Design/Column/Marker, Create Object Mosaic, Crop Image polish (an on-canvas crop box) (Vector Halftone and Image Trace View modes are done) | 5–8 |
+ | Layers, artboards, document setup | 5 | 82% | Layers panel: a confirmation before deleting layers that hold art, Collect for Export, row context menus, the Layer Options dialog for several rows with mixed values, Paste Remembers Layers for sublayers, drag-scrolling a long panel while dragging rows; artboard presets/rearrange polish (Document Setup, New Document and the rest of the Layers panel are done) | 4–7 |
+ | View & navigation | 3 | 70% | New View/Edit Views, multiple windows/arrange, Snap to Pixel/Glyph (print tiling is done) | 9–14 |
+ | Guides, grids, smart guides, snapping, rulers | 3 | 84% | global/video rulers, Spacing Guides, Smart Guides' angle and distance readouts while drawing, Alt swapping a ruler guide's orientation, ruler guides selected together with art (marquee, Shift-click), ruler guides as Layers rows with their own lock and hide (#451: Lock Guides locks them all; Make Guides paths are Layers rows already) (dragging existing guides is done, #414; new guides snapping to side midpoints and artboards, and artboard guides, #451; the drawing tools snapping, with Construction Guides, #506) | 2–4 |
+diff --git a/crates/doc/src/lib.rs b/crates/doc/src/lib.rs
+index e3b54a84..048f201f 100644
+--- a/crates/doc/src/lib.rs
++++ b/crates/doc/src/lib.rs
+@@ -69,7 +69,7 @@ pub use metadata::{CopyrightStatus, DocMetadata};
+ pub use node::Knockout;
+ pub use node::Scaling;
+ pub use node::{ImageMap, ObjectAttributes};
+-pub use node::{ImageObject, LAYER_COLORS, LayerColor, LiveShape, Node, NodeId, NodeKind, OpacityMask};
++pub use node::{ImageObject, LAYER_COLORS, LayerColor, LiveShape, Node, NodeId, NodeKind, OpacityMask, TraceView};
+ pub use orient::OrientedBox;
+ pub use pattern::{Overlap, PatternDef, PatternEdit, RepeatKind, RepeatSpec, TileType};
+ pub use perspective::PerspectiveAttachment;
+diff --git a/crates/doc/src/node.rs b/crates/doc/src/node.rs
+index 13ff5298..1e90572b 100644
+--- a/crates/doc/src/node.rs
++++ b/crates/doc/src/node.rs
+@@ -519,6 +519,28 @@ impl OpacityMask {
+     }
+ }
+ 
++/// The display mode of an Image Trace group.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "camelCase")]
++pub enum TraceView {
++    /// Render vector paths with their filled appearances (default).
++    #[default]
++    #[serde(alias = "tracingResult", alias = "result")]
++    TracingResult,
++    /// Render filled vector paths with high-contrast contour outlines overlaid.
++    #[serde(alias = "tracingResultWithOutlines", alias = "resultWithOutlines")]
++    TracingResultWithOutlines,
++    /// Render 1px vector path outlines only (wireframe preview, no fill).
++    #[serde(alias = "outlines", alias = "outline")]
++    Outlines,
++    /// Render the source image with vector path outlines overlaid.
++    #[serde(alias = "outlinesWithSource", alias = "outlinesWithSourceImage")]
++    OutlinesWithSource,
++    /// Render only the original source image (suppressing vector paths).
++    #[serde(alias = "sourceImage", alias = "source")]
++    SourceImage,
++}
++
+ impl Node {
+     pub fn new(id: NodeId, kind: NodeKind) -> Self {
+         Self {
+@@ -628,6 +650,21 @@ impl Node {
+             && !self.knockout_shape
+             && self.mask.is_none()
+     }
++    /// Extracts the active `TraceView` if this is an Image Trace group, defaulting to `TracingResult`.
++    pub fn trace_view(&self) -> TraceView {
++        self.trace.as_ref().and_then(|t| t.get("view")).and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default()
++    }
++    /// Sets or updates the active `TraceView` in this node's trace metadata.
++    pub fn set_trace_view(&mut self, view: TraceView) {
++        let mut obj = match self.trace.take() {
++            Some(b) if b.is_object() => *b,
++            _ => serde_json::json!({}),
++        };
++        if let (Some(map), Ok(v)) = (obj.as_object_mut(), serde_json::to_value(view)) {
++            map.insert("view".into(), v);
++        }
++        self.trace = Some(Box::new(obj));
++    }
+     /// Kind name as the Layers panel / Properties panel shows it.
+     pub fn kind_label(&self) -> &'static str {
+         match &self.kind {
+@@ -1545,4 +1582,61 @@ mod tests {
+         p.appearance.stroke_mut().unwrap().join = crate::appearance::LineJoin::Round;
+         assert_eq!(p.visual_bounds(), Some(Rect::new(-0.5, -0.5, 10.5, 10.5)));
+     }
++
++    #[test]
++    fn test_trace_view_serialization_and_fallback() {
++        let mut n = Node::new(NodeId(1), NodeKind::Group { children: vec![], clip: false });
++        // 1. None defaults to TracingResult
++        assert_eq!(n.trace, None);
++        assert_eq!(n.trace_view(), TraceView::TracingResult);
++
++        // 2. Malformed JSON gracefully defaults to TracingResult
++        n.trace = Some(Box::new(serde_json::json!({ "view": "invalidVariant123" })));
++        assert_eq!(n.trace_view(), TraceView::TracingResult);
++
++        n.trace = Some(Box::new(serde_json::json!({ "view": 42 })));
++        assert_eq!(n.trace_view(), TraceView::TracingResult);
++
++        n.trace = Some(Box::new(serde_json::json!("not even an object")));
++        assert_eq!(n.trace_view(), TraceView::TracingResult);
++
++        // 3. Round-trip serialization/deserialization for all 5 variants
++        let variants = [
++            (TraceView::TracingResult, "\"tracingResult\""),
++            (TraceView::TracingResultWithOutlines, "\"tracingResultWithOutlines\""),
++            (TraceView::Outlines, "\"outlines\""),
++            (TraceView::OutlinesWithSource, "\"outlinesWithSource\""),
++            (TraceView::SourceImage, "\"sourceImage\""),
++        ];
++
++        for (variant, expected_json) in variants {
++            let serialized = serde_json::to_string(&variant).unwrap();
++            assert_eq!(serialized, expected_json);
++            let deserialized: TraceView = serde_json::from_str(&serialized).unwrap();
++            assert_eq!(deserialized, variant);
++
++            // Test set_trace_view and trace_view roundtrip
++            n.set_trace_view(variant);
++            assert_eq!(n.trace_view(), variant);
++        }
++
++        // 4. Test aliases
++        let aliases = [
++            ("\"result\"", TraceView::TracingResult),
++            ("\"tracingResult\"", TraceView::TracingResult),
++            ("\"resultWithOutlines\"", TraceView::TracingResultWithOutlines),
++            ("\"tracingResultWithOutlines\"", TraceView::TracingResultWithOutlines),
++            ("\"outline\"", TraceView::Outlines),
++            ("\"outlines\"", TraceView::Outlines),
++            ("\"outlinesWithSourceImage\"", TraceView::OutlinesWithSource),
++            ("\"outlinesWithSource\"", TraceView::OutlinesWithSource),
++            ("\"source\"", TraceView::SourceImage),
++            ("\"sourceImage\"", TraceView::SourceImage),
++        ];
++
++        for (json_str, expected_variant) in aliases {
++            let de: TraceView = serde_json::from_str(json_str).unwrap();
++            assert_eq!(de, expected_variant);
++        }
++    }
+ }
+diff --git a/crates/engine/src/cmd/buildcmds.rs b/crates/engine/src/cmd/buildcmds.rs
+index 30745fa2..0e8dabfb 100644
+--- a/crates/engine/src/cmd/buildcmds.rs
++++ b/crates/engine/src/cmd/buildcmds.rs
+@@ -15,7 +15,7 @@ use std::sync::Arc;
+ use serde_json::{Value, json};
+ use vectorcraft_color::{Color, Paint};
+ use vectorcraft_doc::appearance::{AppearanceItem, FillLayer, StrokeLayer};
+-use vectorcraft_doc::{Appearance, Document, Node, NodeId, NodeKind, Selection};
++use vectorcraft_doc::{Appearance, Document, Node, NodeId, NodeKind, Selection, TraceView};
+ use vectorcraft_geom::{FillRule, PathData, Point, Rect, SubPath};
+ use vectorcraft_pathops as po;
+ use vectorcraft_tools::builder::{
+@@ -151,6 +151,15 @@ pub fn specs() -> Vec<CommandSpec> {
+             has_selection_or_ids,
+             trace_expand
+         ),
++        cmd!(
++            "imageTrace.setView",
++            "View",
++            ["Object", "Image Trace"],
++            None,
++            "{id?: NodeId, view: \"tracingResult\"|\"tracingResultWithOutlines\"|\"outlines\"|\"outlinesWithSource\"|\"sourceImage\"} set Image Trace display mode",
++            has_selection_or_ids,
++            trace_set_view
++        ),
+         cmd!(query "imageTrace.presets", "Image Trace Presets", [], None, "{} → {presets: [{name, params}]}", always, |_, _| {
+             Ok(json!({ "presets": tr::presets().into_iter().map(|(n, p)| json!({ "name": n, "params": p })).collect::<Vec<_>>() }))
+         }),
+@@ -647,6 +656,10 @@ pub const MAX_TRACE_ANCHORS: usize = 2_000_000;
+ 
+ fn trace_make(s: &mut Session, p: &Value, expand: bool) -> Result<Value> {
+     const C: &str = "imageTrace.make";
++    let preview = p.get("preview").and_then(Value::as_bool).unwrap_or(false);
++    if preview && s.active().is_some_and(|st| st.undo_group.is_none()) {
++        s.begin_undo_group();
++    }
+     let params = trace_params(p)?;
+     let params_json = serde_json::to_value(&params).map_err(|e| EngineError::Other(e.to_string()))?;
+     // The preset's name if the parameters are exactly that preset's, else "Custom".
+@@ -674,6 +687,9 @@ fn trace_make(s: &mut Session, p: &Value, expand: bool) -> Result<Value> {
+             })
+             .ok_or_else(|| bad(C, "select an image (or an Image Trace group)"))?
+     };
++    let view_override: Option<TraceView> = p.get("view").and_then(|v| serde_json::from_value(v.clone()).ok());
++    let existing_view = s.doc()?.doc.node(target).map(|n| n.trace_view()).unwrap_or_default();
++    let active_view = view_override.unwrap_or(existing_view);
+     let blob = s.doc()?.doc.images.get(&img.key).ok_or_else(|| EngineError::Other(format!("image data `{}` is missing", img.key)))?;
+     let raster = tr::Raster::decode(&blob.bytes).map_err(|e| EngineError::Other(e.to_string()))?;
+     let res = tr::trace_within(&raster, &params, MAX_TRACE_ANCHORS).map_err(|e| EngineError::Other(e.to_string()))?;
+@@ -710,7 +726,11 @@ fn trace_make(s: &mut Session, p: &Value, expand: bool) -> Result<Value> {
+         let mut g = Node::group(gid, children);
+         g.name = if expand { None } else { Some(TRACE_NAME.into()) };
+         if !expand {
+-            g.trace = Some(Box::new(json!({ "preset": preset_label, "params": params_json })));
++            let mut trace_meta = json!({ "preset": preset_label, "params": params_json });
++            if let Ok(v) = serde_json::to_value(active_view) {
++                trace_meta["view"] = v;
++            }
++            g.trace = Some(Box::new(trace_meta));
+         }
+         let (par, idx, _) = d.position(target).ok_or(EngineError::NoNode(target))?;
+         d.remove(target)?;
+@@ -718,6 +738,9 @@ fn trace_make(s: &mut Session, p: &Value, expand: bool) -> Result<Value> {
+         sel.set([gid]);
+         Ok(gid)
+     })?;
++    if !preview && s.active().is_some_and(|st| st.undo_group.is_some()) {
++        s.end_undo_group(false);
++    }
+     Ok(json!({ "id": id.0, "paths": npaths, "anchors": anchors, "colors": colors }))
+ }
+ 
+@@ -762,3 +785,18 @@ fn trace_expand(s: &mut Session, p: &Value) -> Result<Value> {
+     })?;
+     Ok(json!({ "ids": ids_json(&targets) }))
+ }
++
++fn trace_set_view(s: &mut Session, p: &Value) -> Result<Value> {
++    const C: &str = "imageTrace.setView";
++    let view_str = str_param(p, "view").ok_or_else(|| bad(C, "missing view"))?;
++    let view: TraceView = serde_json::from_value(json!(view_str)).map_err(|e| bad(C, format!("unknown view `{view_str}`: {e}")))?;
++    let targets = trace_targets(s, p)?;
++    s.edit("Image Trace View Mode", |d, _| {
++        for id in &targets {
++            let n = d.node_mut(*id).ok_or(EngineError::NoNode(*id))?;
++            n.set_trace_view(view);
++        }
++        Ok(())
++    })?;
++    Ok(json!({ "ids": ids_json(&targets), "view": view_str }))
++}
+diff --git a/crates/engine/src/tests_build.rs b/crates/engine/src/tests_build.rs
+index 04af2e0b..44b45072 100644
+--- a/crates/engine/src/tests_build.rs
++++ b/crates/engine/src/tests_build.rs
+@@ -704,3 +704,102 @@ fn image_trace_object_remembers_its_settings() {
+     let id = st.selection.in_paint_order(&st.doc)[0];
+     assert!(st.doc.node(id).unwrap().trace.is_none());
+ }
++
++#[test]
++fn test_image_trace_set_view_and_expand_invariants() {
++    let mut s = session();
++    let img = image_doc(&mut s);
++    let r = s.execute("imageTrace.make", &json!({"params": {"ignoreWhite": true}})).unwrap();
++    let trace_id = NodeId(r["id"].as_u64().unwrap());
++    assert_ne!(trace_id, img);
++
++    // For each mode, run imageTrace.setView, asserting doc.node(trace_id).unwrap().trace_view()
++    let modes = [
++        ("tracingResultWithOutlines", vectorcraft_doc::TraceView::TracingResultWithOutlines),
++        ("outlines", vectorcraft_doc::TraceView::Outlines),
++        ("outlinesWithSource", vectorcraft_doc::TraceView::OutlinesWithSource),
++        ("sourceImage", vectorcraft_doc::TraceView::SourceImage),
++        ("tracingResult", vectorcraft_doc::TraceView::TracingResult),
++    ];
++    for (mode_str, expected_view) in modes {
++        let res = s.execute("imageTrace.setView", &json!({"id": trace_id.0, "view": mode_str})).unwrap();
++        assert_eq!(res["view"], mode_str);
++        let n = s.doc().unwrap().doc.node(trace_id).unwrap();
++        assert_eq!(n.trace_view(), expected_view);
++    }
++
++    // Non-trace validation (Review Focus 2): Create shape.rectangle, call imageTrace.setView on it,
++    // assert error containing "select an Image Trace object".
++    let rect_id = rect(&mut s, 10.0, 10.0, 50.0, 50.0);
++    let err = s.execute("imageTrace.setView", &json!({"id": rect_id.0, "view": "outlines"})).unwrap_err();
++    assert!(err.to_string().contains("select an Image Trace object"), "err: {err}");
++
++    s.execute("select.set", &json!({"ids": [rect_id.0]})).unwrap();
++    let err_sel = s.execute("imageTrace.setView", &json!({"view": "outlines"})).unwrap_err();
++    assert!(err_sel.to_string().contains("select an Image Trace object"), "err: {err_sel}");
++
++    // Expand invariant (Review Focus 3): Switch trace to outlines, call imageTrace.expand,
++    // assert expanded.trace.is_none(), expanded.name.is_none(), children non-empty with !c.appearance.fill_paint().is_none().
++    s.execute("imageTrace.setView", &json!({"id": trace_id.0, "view": "outlines"})).unwrap();
++    assert_eq!(s.doc().unwrap().doc.node(trace_id).unwrap().trace_view(), vectorcraft_doc::TraceView::Outlines);
++    s.execute("imageTrace.expand", &json!({"id": trace_id.0})).unwrap();
++    let expanded = s.doc().unwrap().doc.node(trace_id).unwrap();
++    assert!(expanded.trace.is_none());
++    assert!(expanded.name.is_none());
++    let children = expanded.children().unwrap();
++    assert!(!children.is_empty());
++    assert!(children.iter().all(|c| !matches!(c.kind, NodeKind::Image(_))));
++    assert!(children.iter().all(|c| !c.appearance.fill_paint().is_none()));
++}
++
++#[test]
++fn test_image_trace_preview_coalescing() {
++    let mut s = session();
++    let img = image_doc(&mut s);
++    let initial_count = s.doc().unwrap().history.undo.len();
++
++    // Select image
++    s.execute("select.set", &json!({"ids": [img.0]})).unwrap();
++
++    // Emulate 4 rapid preview drag frames (preview: true with changing threshold)
++    let mut trace_id = img;
++    for th in [64, 96, 128, 160] {
++        let r = s
++            .execute(
++                "imageTrace.make",
++                &json!({
++                    "id": trace_id.0,
++                    "preview": true,
++                    "params": { "threshold": th }
++                }),
++            )
++            .unwrap();
++        trace_id = NodeId(r["id"].as_u64().unwrap());
++    }
++
++    // Commit final drag release with preview: false
++    let r = s
++        .execute(
++            "imageTrace.make",
++            &json!({
++                "id": trace_id.0,
++                "preview": false,
++                "params": { "threshold": 192 }
++            }),
++        )
++        .unwrap();
++    let final_trace_id = NodeId(r["id"].as_u64().unwrap());
++
++    // Assert s.doc().unwrap().history.undo.len() == initial_count + 1
++    assert_eq!(s.doc().unwrap().history.undo.len(), initial_count + 1, "all preview frames coalesced into 1 undo step");
++
++    // Run edit.undo once, assert doc node reverts to original image
++    s.execute("edit.undo", &json!({})).unwrap();
++    assert_eq!(s.doc().unwrap().history.undo.len(), initial_count);
++
++    let doc = &s.doc().unwrap().doc;
++    assert!(doc.node(final_trace_id).is_none() || final_trace_id == img);
++    let orig = doc.node(img).expect("original image restored");
++    assert!(matches!(orig.kind, NodeKind::Image(_)));
++    assert!(orig.visible);
++}
+diff --git a/crates/render/src/lib.rs b/crates/render/src/lib.rs
+index 42d68dc0..2de94d38 100644
+--- a/crates/render/src/lib.rs
++++ b/crates/render/src/lib.rs
+@@ -21,7 +21,7 @@ pub mod proof;
+ use std::collections::HashMap;
+ use std::sync::Arc;
+ 
+-use vectorcraft_doc::{AppearanceItem, Document, Node, NodeId, NodeKind, StrokeAlign, StrokeLayer, TextObject};
++use vectorcraft_doc::{AppearanceItem, Document, Node, NodeId, NodeKind, StrokeAlign, StrokeLayer, TextObject, TraceView};
+ use vectorcraft_geom::{Affine, BezPath, FillRule, Rect, Shape};
+ use vello_cpu::kurbo;
+ use vello_cpu::peniko::{self, BlendMode, Compose, Mix};
+@@ -637,7 +637,7 @@ impl Renderer {
+             NodeKind::Layer { children, clip: false, .. } | NodeKind::Group { children, clip: false } if !fx::has_object_fx(a) => {
+                 let mut acc: Option<Rect> = None;
+                 for c in children {
+-                    if c.visible {
++                    if c.visible || (is_trace_group(a) && matches!(a.trace_view(), TraceView::SourceImage | TraceView::OutlinesWithSource)) {
+                         acc = vectorcraft_geom::union_opt(acc, self.bounds_of(c));
+                     }
+                 }
+@@ -871,6 +871,45 @@ impl Renderer {
+ 
+     /// What `n` draws inside its transparency group (`knockout`: its children knock each other out).
+     fn draw_content(&mut self, ctx: &mut RenderContext, f: &Frame, n: &Node, knockout: bool) {
++        if is_trace_group(n) && !f.opts.outline {
++            let view = n.trace_view();
++            if let NodeKind::Group { children, .. } = &n.kind
++                && let Some((source_img, vector_paths)) = children.split_first()
++            {
++                match view {
++                    TraceView::TracingResult => {
++                        self.draw_children(ctx, f, vector_paths, knockout);
++                    }
++                    TraceView::TracingResultWithOutlines => {
++                        self.draw_children(ctx, f, vector_paths, knockout);
++                        for vp in vector_paths {
++                            if let Some(bp) = vp.stroke_path() {
++                                self.hairline(ctx, f, &bp, [0, 160, 255, 255]);
++                            }
++                        }
++                    }
++                    TraceView::Outlines => {
++                        for vp in vector_paths {
++                            if let Some(bp) = vp.stroke_path() {
++                                self.hairline(ctx, f, &bp, [0, 0, 0, 255]);
++                            }
++                        }
++                    }
++                    TraceView::OutlinesWithSource => {
++                        self.draw_node(ctx, f, source_img, true);
++                        for vp in vector_paths {
++                            if let Some(bp) = vp.stroke_path() {
++                                self.hairline(ctx, f, &bp, [0, 160, 255, 255]);
++                            }
++                        }
++                    }
++                    TraceView::SourceImage => {
++                        self.draw_node(ctx, f, source_img, true);
++                    }
++                }
++                return;
++            }
++        }
+         match &n.kind {
+             NodeKind::Layer { children, clip: false, .. } | NodeKind::Group { children, clip: false } => {
+                 self.draw_children(ctx, f, children, knockout)
+@@ -1455,6 +1494,13 @@ impl Renderer {
+     }
+ }
+ 
++/// Whether `n` is an Image Trace group: a non-clipping group named "Image Trace" whose first child is an Image.
++fn is_trace_group(n: &Node) -> bool {
++    matches!(n.kind, NodeKind::Group { clip: false, .. })
++        && n.name.as_deref() == Some("Image Trace")
++        && n.children().is_some_and(|c| c.first().is_some_and(|i| matches!(i.kind, NodeKind::Image(_))))
++}
++
+ /// Can image node `n` (`im`) clipped by `region` be painted straight into the region: visible,
+ /// with no transparency, effects or paint of its own, and the region inside the image's frame
+ /// (within a pixel), so no paint past the image's edge shows?
+diff --git a/crates/render/tests/trace_render_tests.rs b/crates/render/tests/trace_render_tests.rs
+new file mode 100644
+index 00000000..b33a2bda
+--- /dev/null
++++ b/crates/render/tests/trace_render_tests.rs
+@@ -0,0 +1,160 @@
++//! Integration tests for Image Trace multi-mode hairline and bitmap rendering.
++#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
++
++use std::sync::Arc;
++use vectorcraft_color::{Color, Paint};
++use vectorcraft_doc::{Appearance, Document, Node, NodeId, NodeKind, TraceView};
++use vectorcraft_geom::{Affine, Rect, Shape};
++use vectorcraft_render::{RenderOptions, Renderer};
++
++#[test]
++fn test_render_all_five_trace_view_modes() {
++    let mut doc = Document::new(200.0, 200.0);
++    let mut r = Renderer::new();
++
++    // Encode a 10x10 mock PNG using image::RgbaImage directly (avoiding undeclared trace dependency)
++    let img = image::RgbaImage::from_pixel(10, 10, image::Rgba([255, 0, 0, 255]));
++    let mut png_bytes = Vec::new();
++    img.write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png).unwrap();
++    doc.images.insert("test_key".into(), vectorcraft_doc::ImageBlob::new("image/png", png_bytes));
++
++    let mut img_node = Node::new(
++        NodeId(10),
++        NodeKind::Image(vectorcraft_doc::ImageObject {
++            key: "test_key".into(),
++            xf: Affine::IDENTITY,
++            width: 100,
++            height: 100,
++            link: None,
++            placement: Default::default(),
++        }),
++    );
++    img_node.name = Some("Source Image".into());
++    img_node.visible = false;
++
++    let rect_path = vectorcraft_geom::PathData::from_bezpath(&Rect::new(10.0, 10.0, 90.0, 90.0).to_path(0.1));
++    let mut rect_node = Node::path(NodeId(11), rect_path, Appearance::default());
++    rect_node.appearance.set_fill(Paint::solid(Color::rgb8(0, 0, 255)));
++
++    let mut trace_group = Node::group(NodeId(1), vec![Arc::new(img_node), Arc::new(rect_node)]);
++    trace_group.name = Some("Image Trace".into());
++
++    let opts = RenderOptions { outline: false, background: Some([255, 255, 255, 255]), artboards: true, ..Default::default() };
++
++    for view in
++        [TraceView::TracingResult, TraceView::TracingResultWithOutlines, TraceView::Outlines, TraceView::OutlinesWithSource, TraceView::SourceImage]
++    {
++        trace_group.set_trace_view(view);
++        let mut test_doc = doc.clone();
++        test_doc.insert(None, 0, trace_group.clone()).unwrap();
++        let rendered = r.render(&test_doc, 200, 200, Affine::IDENTITY, &opts);
++        assert_eq!(rendered.width, 200);
++        assert_eq!(rendered.height, 200);
++        assert!(rendered.pixels.iter().any(|&b| b != 0));
++
++        let px_at = |x: usize, y: usize| -> [u8; 4] {
++            let idx = (y * 200 + x) * 4;
++            [rendered.pixels[idx], rendered.pixels[idx + 1], rendered.pixels[idx + 2], rendered.pixels[idx + 3]]
++        };
++
++        // Differentiate mode behaviors at center (50, 50):
++        let center = px_at(50, 50);
++        match view {
++            TraceView::TracingResult => {
++                // Vector path fill is blue: [0, 0, 255, 255]
++                assert_eq!(center, [0, 0, 255, 255], "TracingResult should show vector blue fill");
++            }
++            TraceView::TracingResultWithOutlines => {
++                // Vector path fill is blue at center: [0, 0, 255, 255]
++                assert_eq!(center, [0, 0, 255, 255], "TracingResultWithOutlines should show vector blue fill");
++                // On the border at (10, 50), hairline [0, 160, 255, 255] is painted
++                let edge = px_at(10, 50);
++                assert!(edge[1] > 50, "TracingResultWithOutlines edge should have cyan green component, got {edge:?}");
++            }
++            TraceView::Outlines => {
++                // Outlines only: interior is white background [255, 255, 255, 255]
++                assert_eq!(center, [255, 255, 255, 255], "Outlines should show background at center");
++                // On the border at (10, 50), black hairline [0, 0, 0, 255] antialiased over white background
++                let edge = px_at(10, 50);
++                assert!(edge[0] < 200 && edge[1] < 200 && edge[2] < 200, "Outlines edge should be darkened by black hairline, got {edge:?}");
++            }
++            TraceView::OutlinesWithSource => {
++                // Source image is red: [255, 0, 0, 255]
++                assert_eq!(center, [255, 0, 0, 255], "OutlinesWithSource should show red image at center");
++                // On the border at (10, 50), hairline [0, 160, 255, 255] is painted
++                let edge = px_at(10, 50);
++                assert!(edge[1] > 50 || edge[2] > 50, "OutlinesWithSource edge should have cyan component, got {edge:?}");
++            }
++            TraceView::SourceImage => {
++                // Source image is red: [255, 0, 0, 255]
++                assert_eq!(center, [255, 0, 0, 255], "SourceImage should show red image at center");
++            }
++        }
++    }
++}
++
++#[test]
++fn test_render_trace_group_with_missing_image_graceful_fallback() {
++    let mut doc = Document::new(200.0, 200.0);
++    let mut r = Renderer::new();
++
++    let mut corrupt_group = Node::group(NodeId(1), vec![]);
++    corrupt_group.name = Some("Image Trace".into());
++    corrupt_group.set_trace_view(TraceView::SourceImage);
++
++    doc.insert(None, 0, corrupt_group).unwrap();
++    let opts = RenderOptions::default();
++    let rendered = r.render(&doc, 200, 200, Affine::IDENTITY, &opts);
++    assert_eq!(rendered.width, 200);
++}
++
++#[test]
++fn test_render_trace_group_source_image_bounds_and_visibility() {
++    let mut doc = Document::new(200.0, 200.0);
++    let mut r = Renderer::new();
++
++    // 10x10 green image positioned at (0, 0)
++    let img = image::RgbaImage::from_pixel(10, 10, image::Rgba([0, 255, 0, 255]));
++    let mut png_bytes = Vec::new();
++    img.write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png).unwrap();
++    doc.images.insert("green_img".into(), vectorcraft_doc::ImageBlob::new("image/png", png_bytes));
++
++    let mut img_node = Node::new(
++        NodeId(10),
++        NodeKind::Image(vectorcraft_doc::ImageObject {
++            key: "green_img".into(),
++            xf: Affine::IDENTITY,
++            width: 50,
++            height: 50,
++            link: None,
++            placement: Default::default(),
++        }),
++    );
++    img_node.visible = false;
++
++    // Vector path at (100, 100) -> (150, 150)
++    let rect_path = vectorcraft_geom::PathData::from_bezpath(&Rect::new(100.0, 100.0, 150.0, 150.0).to_path(0.1));
++    let mut rect_node = Node::path(NodeId(11), rect_path, Appearance::default());
++    rect_node.appearance.set_fill(Paint::solid(Color::rgb8(0, 0, 255)));
++
++    let mut trace_group = Node::group(NodeId(1), vec![Arc::new(img_node), Arc::new(rect_node)]);
++    trace_group.name = Some("Image Trace".into());
++    trace_group.set_trace_view(TraceView::SourceImage);
++
++    // Enclosing group
++    let parent_group = Node::group(NodeId(2), vec![Arc::new(trace_group)]);
++    doc.insert(None, 0, parent_group).unwrap();
++
++    let opts = RenderOptions { background: Some([255, 255, 255, 255]), ..Default::default() };
++    let rendered = r.render(&doc, 200, 200, Affine::IDENTITY, &opts);
++
++    // Green image should be visible at (25, 25)
++    let idx = (25 * 200 + 25) * 4;
++    let px = [rendered.pixels[idx], rendered.pixels[idx + 1], rendered.pixels[idx + 2], rendered.pixels[idx + 3]];
++    assert_eq!(px, [0, 255, 0, 255], "SourceImage inside parent group should render green image even though node.visible is false");
++
++    // Vector path should NOT be rendered in SourceImage mode
++    let idx_vec = (125 * 200 + 125) * 4;
++    let px_vec = [rendered.pixels[idx_vec], rendered.pixels[idx_vec + 1], rendered.pixels[idx_vec + 2], rendered.pixels[idx_vec + 3]];
++    assert_eq!(px_vec, [255, 255, 255, 255], "Vector path should not be drawn in SourceImage mode");
++}
+diff --git a/crates/ui-egui/src/i18n/cs.tsv b/crates/ui-egui/src/i18n/cs.tsv
+index c44ada02..a8c38774 100644
+--- a/crates/ui-egui/src/i18n/cs.tsv
++++ b/crates/ui-egui/src/i18n/cs.tsv
+@@ -634,3 +634,9 @@
+ 	Clipboard Handling	Práce se schránkou
+ 	Appearance of Black	Vzhled černé
+ 	Devices	Zařízení
++	Cluster by Color	Shlukovat podle barvy
++	Group by Color	Seskupit podle barvy
++	Render Labeled Overlay	Vykreslit překryv s popisky
++	Semantic Document Summary	Sémantický souhrn dokumentu
++	View:	Zobrazení:
++	View Source Image	Zobrazit zdrojový obrázek
+diff --git a/crates/ui-egui/src/i18n/es.tsv b/crates/ui-egui/src/i18n/es.tsv
+index e4ceed41..fecaae87 100644
+--- a/crates/ui-egui/src/i18n/es.tsv
++++ b/crates/ui-egui/src/i18n/es.tsv
+@@ -3598,3 +3598,14 @@ axis	Both	Ambos
+ 	Off: an editable copy of its art, embedded in this document.	Desactivado: una copia editable de su ilustración, incrustada en este documento.
+ 	Images: link to the file instead of only embedding it.	Imágenes: vincular al archivo en lugar de solo incrustarlo.
+ 	VectorCraft documents: one locked object, updated when the file changes.	Documentos de VectorCraft: un objeto bloqueado que se actualiza cuando cambia el archivo.
++	Cluster by Color	Agrupar por color (clúster)
++	Group by Color	Agrupar por color
++	Render Labeled Overlay	Interpretar superposición con etiquetas
++	Semantic Document Summary	Resumen semántico del documento
++	View:	Ver:
++	View Source Image	Ver imagen de origen
++	Tracing Result	Resultado del calco
++	Tracing Result with Outlines	Resultado del calco con contornos
++	Outlines	Contornos
++	Outlines with Source Image	Contornos con imagen de origen
++	Source Image	Imagen de origen
+diff --git a/crates/ui-egui/src/i18n/it.tsv b/crates/ui-egui/src/i18n/it.tsv
+index decd91fd..45f335ce 100644
+--- a/crates/ui-egui/src/i18n/it.tsv
++++ b/crates/ui-egui/src/i18n/it.tsv
+@@ -3598,3 +3598,14 @@ axis	Both	Entrambi
+ 	Off: an editable copy of its art, embedded in this document.	Disattivato: una copia modificabile della sua grafica, incorporata in questo documento.
+ 	Images: link to the file instead of only embedding it.	Immagini: collega il file invece di incorporarlo soltanto.
+ 	VectorCraft documents: one locked object, updated when the file changes.	Documenti VectorCraft: un unico oggetto bloccato, aggiornato quando il file cambia.
++	Cluster by Color	Raggruppa per colore (cluster)
++	Group by Color	Raggruppa per colore
++	Render Labeled Overlay	Esegui rendering sovrapposizione con etichette
++	Semantic Document Summary	Riepilogo semantico del documento
++	View:	Visualizza:
++	View Source Image	Visualizza immagine sorgente
++	Tracing Result	Risultato ricalco
++	Tracing Result with Outlines	Risultato ricalco con contorni
++	Outlines	Contorni
++	Outlines with Source Image	Contorni con immagine sorgente
++	Source Image	Immagine sorgente
+diff --git a/crates/ui-egui/src/i18n/ja.tsv b/crates/ui-egui/src/i18n/ja.tsv
+index b479ea62..1f2f4fb1 100644
+--- a/crates/ui-egui/src/i18n/ja.tsv
++++ b/crates/ui-egui/src/i18n/ja.tsv
+@@ -3060,3 +3060,14 @@ theme	Appearance	外観
+ 	Off: an editable copy of its art, embedded in this document.	オフ：アートの編集可能なコピーをこのドキュメントに埋め込みます。
+ 	Images: link to the file instead of only embedding it.	画像：埋め込むだけでなく、ファイルにリンクします。
+ 	VectorCraft documents: one locked object, updated when the file changes.	VectorCraft ドキュメント：ロックされた 1 つのオブジェクト。ファイルの変更時に更新されます。
++	Cluster by Color	カラーでクラスター化
++	Group by Color	カラーでグループ化
++	Render Labeled Overlay	ラベル付きオーバーレイをレンダリング
++	Semantic Document Summary	ドキュメントのセマンティックサマリー
++	View:	表示:
++	View Source Image	元の画像を表示
++	Tracing Result	トレース結果
++	Tracing Result with Outlines	アウトラインとトレース結果
++	Outlines	アウトライン
++	Outlines with Source Image	元画像とアウトライン
++	Source Image	元画像
+diff --git a/crates/ui-egui/src/i18n/pt-br.tsv b/crates/ui-egui/src/i18n/pt-br.tsv
+index 9500ba89..e596204f 100644
+--- a/crates/ui-egui/src/i18n/pt-br.tsv
++++ b/crates/ui-egui/src/i18n/pt-br.tsv
+@@ -2648,3 +2648,9 @@
+ 	Off: an editable copy of its art, embedded in this document.	Desativado: uma cópia editável da arte, incorporada neste documento.
+ 	Images: link to the file instead of only embedding it.	Imagens: vincular ao arquivo em vez de apenas incorporá-lo.
+ 	VectorCraft documents: one locked object, updated when the file changes.	Documentos do VectorCraft: um objeto bloqueado, atualizado quando o arquivo muda.
++	Cluster by Color	Agrupar por Cor (Cluster)
++	Group by Color	Agrupar por Cor
++	Render Labeled Overlay	Renderizar Sobreposição com Rótulos
++	Semantic Document Summary	Resumo Semântico do Documento
++	View:	Exibir:
++	View Source Image	Visualizar Imagem de Origem
+diff --git a/crates/ui-egui/src/i18n/zh-hans.tsv b/crates/ui-egui/src/i18n/zh-hans.tsv
+index ddc8134f..8f0cad1e 100644
+--- a/crates/ui-egui/src/i18n/zh-hans.tsv
++++ b/crates/ui-egui/src/i18n/zh-hans.tsv
+@@ -3315,3 +3315,14 @@ axis	Both	两者
+ 	Off: an editable copy of its art, embedded in this document.	关闭：将其图稿的可编辑副本嵌入此文档。
+ 	Images: link to the file instead of only embedding it.	图像：链接到文件，而不只是嵌入。
+ 	VectorCraft documents: one locked object, updated when the file changes.	VectorCraft 文档：一个锁定对象，文件更改时随之更新。
++	Cluster by Color	按颜色聚类
++	Group by Color	按颜色编组
++	Render Labeled Overlay	渲染带标签的覆盖图
++	Semantic Document Summary	文档语义摘要
++	View:	视图:
++	View Source Image	查看源图像
++	Tracing Result	描摹结果
++	Tracing Result with Outlines	带轮廓的描摹结果
++	Outlines	轮廓
++	Outlines with Source Image	带源图像的轮廓
++	Source Image	源图像
+diff --git a/crates/ui-egui/src/i18n/zh-hant.tsv b/crates/ui-egui/src/i18n/zh-hant.tsv
+index a9d704ba..a7ef539f 100644
+--- a/crates/ui-egui/src/i18n/zh-hant.tsv
++++ b/crates/ui-egui/src/i18n/zh-hant.tsv
+@@ -3090,3 +3090,14 @@ axis	Both	兩者
+ 	Off: an editable copy of its art, embedded in this document.	關閉：將其圖稿的可編輯副本內嵌在此文件中。
+ 	Images: link to the file instead of only embedding it.	影像：連結至檔案，而不只是嵌入。
+ 	VectorCraft documents: one locked object, updated when the file changes.	VectorCraft 文件：單一鎖定物件，檔案變更時隨之更新。
++	Cluster by Color	依顏色分群
++	Group by Color	依顏色群組
++	Render Labeled Overlay	演算帶標籤的覆蓋圖
++	Semantic Document Summary	文件語意摘要
++	View:	檢視:
++	View Source Image	檢視原始影像
++	Tracing Result	描圖結果
++	Tracing Result with Outlines	帶外框的描圖結果
++	Outlines	外框
++	Outlines with Source Image	帶原始影像的外框
++	Source Image	原始影像
+diff --git a/crates/ui-egui/src/panels/image_trace.rs b/crates/ui-egui/src/panels/image_trace.rs
+index bda45ab0..1b4fc86d 100644
+--- a/crates/ui-egui/src/panels/image_trace.rs
++++ b/crates/ui-egui/src/panels/image_trace.rs
+@@ -12,8 +12,16 @@ use crate::widgets::{self, menu_item};
+ 
+ const MODES: [(&str, &str); 3] = [("blackAndWhite", "Black and White"), ("grayscale", "Grayscale"), ("color", "Color")];
+ 
+-/// Panel state: the preset name, the current parameters and the last result's counts.
+-#[derive(Clone, Default)]
++pub(crate) const VIEW_MODES: [(&str, &str); 5] = [
++    ("tracingResult", "Tracing Result"),
++    ("tracingResultWithOutlines", "Tracing Result with Outlines"),
++    ("outlines", "Outlines"),
++    ("outlinesWithSource", "Outlines with Source Image"),
++    ("sourceImage", "Source Image"),
++];
++
++/// Panel state: the preset name, the current parameters, the last result's counts, and view/preview settings.
++#[derive(Clone)]
+ struct TraceUi {
+     preset: String,
+     params: Value,
+@@ -21,6 +29,23 @@ struct TraceUi {
+     /// The selected Image Trace object's stored settings last adopted (so edits in progress
+     /// aren't overwritten until the object changes).
+     synced: Value,
++    view: String,
++    preview: bool,
++    last_drag_time: f64,
++}
++
++impl Default for TraceUi {
++    fn default() -> Self {
++        Self {
++            preset: String::new(),
++            params: Value::Null,
++            info: None,
++            synced: Value::Null,
++            view: "tracingResult".into(),
++            preview: true,
++            last_drag_time: 0.0,
++        }
++    }
+ }
+ 
+ fn presets(app: &mut VectorcraftApp) -> Vec<(String, Value)> {
+@@ -52,6 +77,14 @@ pub(crate) fn selected_preset(app: &VectorcraftApp) -> Option<String> {
+     Some(n.trace.as_ref().and_then(|t| t["preset"].as_str()).unwrap_or("Custom").to_string())
+ }
+ 
++/// The view mode of the one selected Image Trace object.
++pub(crate) fn selected_view(app: &VectorcraftApp) -> Option<String> {
++    let st = app.session.active()?;
++    let [id] = st.selection.objects[..] else { return None };
++    let n = st.doc.node(id).filter(|n| is_trace(n))?;
++    serde_json::to_value(n.trace_view()).ok()?.as_str().map(ToString::to_string)
++}
++
+ /// Trace the selected image, or trace the selected Image Trace object again, with built-in `preset`.
+ fn trace_with(app: &mut VectorcraftApp, preset: &str) {
+     // A failure is reported in the status bar.
+@@ -94,12 +127,25 @@ pub(crate) fn preset_dropdown(app: &mut VectorcraftApp, ui: &mut Ui, current: &s
+     }
+ }
+ 
+-/// The Control bar for one selected Image Trace object: its preset, the Image Trace panel and
++/// Dropdown to select the active Image Trace View mode.
++pub(crate) fn view_dropdown(app: &mut VectorcraftApp, ui: &mut Ui, current: &str, width: f32) {
++    let current_label = VIEW_MODES.iter().find(|m| m.0 == current).map_or("Tracing Result", |m| m.1);
++    let labels: Vec<&str> = VIEW_MODES.iter().map(|m| m.1).collect();
++    if let Some(i) = widgets::dropdown(ui, "trace-view-mode", current_label, &labels, width) {
++        let chosen = VIEW_MODES[i].0;
++        let _ = app.run("imageTrace.setView", json!({ "view": chosen }));
++    }
++}
++
++/// The Control bar for one selected Image Trace object: its preset, view mode, the Image Trace panel and
+ /// Expand. Whether it is one.
+ pub fn control_bar(app: &mut VectorcraftApp, ui: &mut Ui) -> bool {
+     let Some(preset) = selected_preset(app) else { return false };
+     widgets::dim_label(ui, tl!("Preset:"));
+-    preset_dropdown(app, ui, &preset, 150.0);
++    preset_dropdown(app, ui, &preset, 130.0);
++    let view = selected_view(app).unwrap_or_else(|| "tracingResult".into());
++    widgets::dim_label(ui, tl!("View:"));
++    view_dropdown(app, ui, &view, 140.0);
+     if widgets::icon_button(ui, "image", tl!("Image Trace"), false, 24.0).clicked() {
+         app.ui.open_panel = Some("imageTrace".into());
+     }
+@@ -110,9 +156,9 @@ pub fn control_bar(app: &mut VectorcraftApp, ui: &mut Ui) -> bool {
+     true
+ }
+ 
+-fn trace(app: &mut VectorcraftApp, st: &mut TraceUi) {
++fn trace(app: &mut VectorcraftApp, st: &mut TraceUi, preview: bool) {
+     let preset = if st.preset == "Custom" { "Default" } else { st.preset.as_str() };
+-    match app.run("imageTrace.make", json!({ "preset": preset, "params": st.params })) {
++    match app.run("imageTrace.make", json!({ "preset": preset, "params": st.params, "preview": preview })) {
+         Ok(r) => st.info = Some((r["paths"].as_u64().unwrap_or(0), r["anchors"].as_u64().unwrap_or(0), r["colors"].as_u64().unwrap_or(0))),
+         Err(e) => app.ui.status = e,
+     }
+@@ -143,6 +189,9 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
+     if let Some(t) = stored.filter(|t| *t != st.synced) {
+         st.preset = t["preset"].as_str().unwrap_or("Custom").to_string();
+         st.params = t["params"].clone();
++        if let Some(v) = t.get("view").and_then(Value::as_str) {
++            st.view = v.to_string();
++        }
+         st.synced = t;
+     }
+     let mut retrace = false;
+@@ -156,6 +205,17 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
+             retrace = true;
+         }
+     });
++    ui.horizontal(|ui| {
++        widgets::dim_label(ui, tl!("View:"));
++        view_dropdown(app, ui, &st.view, 140.0);
++        // Eyeball toggle button for quick source inspection
++        let is_source = st.view == "sourceImage";
++        if widgets::icon_button(ui, "eye", tl!("View Source Image"), is_source, 22.0).clicked() {
++            let new_view = if is_source { "tracingResult" } else { "sourceImage" };
++            st.view = new_view.to_string();
++            let _ = app.run("imageTrace.setView", json!({ "view": new_view }));
++        }
++    });
+     ui.horizontal(|ui| {
+         widgets::dim_label(ui, tl!("Mode:"));
+         let mode = st.params["mode"].as_str().unwrap_or("blackAndWhite").to_string();
+@@ -175,11 +235,18 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
+     };
+     let mut v = st.params[key].as_f64().unwrap_or(0.0);
+     let (changed, release) = slider(ui, label, &mut v, range, "");
++    let now = ui.input(|i| i.time);
+     if changed {
+         st.params[key] = json!(v.round() as u64);
+         st.preset = "Custom".into();
++        if st.preview && is_trace && now - st.last_drag_time >= 0.060 {
++            st.last_drag_time = now;
++            trace(app, &mut st, true);
++        }
++    }
++    if release && is_trace {
++        trace(app, &mut st, false);
+     }
+-    retrace |= release;
+ 
+     let open: bool = !pstate::<bool>(ui.ctx(), "it-advanced-closed");
+     if ui.add(egui::Button::new(format!("{} {}", if open { "▾" } else { "▸" }, tl!("Advanced"))).frame(false)).clicked() {
+@@ -191,11 +258,18 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
+         {
+             let mut v = st.params[key].as_f64().unwrap_or(0.0);
+             let (changed, release) = slider(ui, label, &mut v, range, suffix);
++            let now = ui.input(|i| i.time);
+             if changed {
+                 st.params[key] = if key == "noise" { json!(v.round() as u64) } else { json!(v.round()) };
+                 st.preset = "Custom".into();
++                if st.preview && is_trace && now - st.last_drag_time >= 0.060 {
++                    st.last_drag_time = now;
++                    trace(app, &mut st, true);
++                }
++            }
++            if release && is_trace {
++                trace(app, &mut st, false);
+             }
+-            retrace |= release;
+         }
+         ui.horizontal(|ui| {
+             widgets::dim_label(ui, tl!("Method:"));
+@@ -227,16 +301,19 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
+         );
+     }
+     ui.horizontal(|ui| {
++        if widgets::check(ui, tl!("Preview"), st.preview, true) {
++            st.preview = !st.preview;
++        }
+         let r = ui.add_enabled_ui(is_trace || is_image, |ui| widgets::flat_button(ui, tl!("Trace"), 80.0)).inner;
+         if r.on_disabled_hover_text(tl!("Select an image to trace")).clicked() {
+-            trace(app, &mut st);
++            trace(app, &mut st, false);
+         }
+         if ui.add_enabled_ui(is_trace, |ui| widgets::flat_button(ui, tl!("Expand"), 80.0)).inner.clicked() {
+             app.run("imageTrace.expand", json!({})).ok();
+         }
+     });
+     if retrace && is_trace {
+-        trace(app, &mut st);
++        trace(app, &mut st, false);
+     }
+     set_pstate(ui.ctx(), "image-trace", st);
+ }
+@@ -273,4 +350,58 @@ mod tests {
+             out.textures_delta.clear();
+         }
+     }
++
++    #[test]
++    fn test_image_trace_panel_with_view_modes_headless() {
++        let mut app = VectorcraftApp::new(vectorcraft_engine::Session::new(), Default::default());
++        app.session.execute("file.new", &json!({"width": 200, "height": 200})).unwrap();
++
++        let img = image::RgbaImage::from_fn(20, 20, |x, y| image::Rgba([x as u8, y as u8, 0, 255]));
++        let mut png = Vec::new();
++        img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
++
++        let _img_id = app
++            .session
++            .edit("img", |d, sel| {
++                d.images.insert("img1".into(), vectorcraft_doc::ImageBlob::new("image/png", png));
++                let id = d.alloc_id();
++                let l = d.default_layer();
++                d.insert(
++                    l,
++                    0,
++                    vectorcraft_doc::Node::new(
++                        id,
++                        vectorcraft_doc::NodeKind::Image(vectorcraft_doc::ImageObject {
++                            key: "img1".into(),
++                            width: 20,
++                            height: 20,
++                            xf: vectorcraft_geom::Affine::IDENTITY,
++                            link: None,
++                            placement: Default::default(),
++                        }),
++                    ),
++                )?;
++                sel.set([id]);
++                Ok(id)
++            })
++            .unwrap();
++
++        let trace_res = app.session.execute("imageTrace.make", &json!({ "preset": "Default" })).unwrap();
++        let trace_id = vectorcraft_doc::NodeId(trace_res["id"].as_u64().unwrap());
++        app.session.select(|_, sel| sel.set([trace_id])).unwrap();
++
++        assert_eq!(selected_view(&app), Some("tracingResult".to_string()));
++        app.run("imageTrace.setView", json!({ "view": "outlines" })).unwrap();
++        assert_eq!(selected_view(&app), Some("outlines".to_string()));
++
++        for _ in 0..3 {
++            let ctx = egui::Context::default();
++            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
++                show(&mut app, ui);
++                menu(&mut app, ui);
++                control_bar(&mut app, ui);
++            });
++            out.textures_delta.clear();
++        }
++    }
+ }
+diff --git a/crates/ui-egui/src/panels/properties.rs b/crates/ui-egui/src/panels/properties.rs
+index 158e3317..6e3b8e42 100644
+--- a/crates/ui-egui/src/panels/properties.rs
++++ b/crates/ui-egui/src/panels/properties.rs
+@@ -155,13 +155,18 @@ fn image_section(app: &mut VectorcraftApp, ui: &mut Ui) {
+ }
+ 
+ /// The one selected Image Trace object: its preset (choosing another traces it again with that
+-/// one), Expand and Release.
++/// one), view mode, Expand and Release.
+ fn trace_section(app: &mut VectorcraftApp, ui: &mut Ui, preset: &str) {
+     section_header(ui, tl!("Image Trace"));
+     ui.horizontal(|ui| {
+         dim_label(ui, tl!("Preset:"));
+         crate::panels::image_trace::preset_dropdown(app, ui, preset, ui.available_width());
+     });
++    let view = crate::panels::image_trace::selected_view(app).unwrap_or_else(|| "tracingResult".into());
++    ui.horizontal(|ui| {
++        dim_label(ui, tl!("View:"));
++        crate::panels::image_trace::view_dropdown(app, ui, &view, ui.available_width());
++    });
+     let w = (ui.available_width() - 6.0) / 2.0;
+     ui.horizontal(|ui| {
+         for (label, id) in [(tl!("Expand"), "imageTrace.expand"), (tl!("Release"), "imageTrace.release")] {

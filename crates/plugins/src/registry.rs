@@ -14,8 +14,22 @@ use crate::{Limits, Plugin, Result};
 static PLUGINS: RwLock<BTreeMap<String, Arc<Plugin>>> = RwLock::new(BTreeMap::new());
 static REVISION: AtomicU64 = AtomicU64::new(0);
 
+/// Ensures a manifest entry path does not contain null bytes or directory traversal (SEC-503).
+pub fn validate_manifest_entry(manifest: &crate::Manifest) -> Result<()> {
+    if let Some(entry) = &manifest.entry
+        && (entry.contains('\0')
+            || std::path::Path::new(entry)
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::RootDir | std::path::Component::Prefix(_))))
+    {
+        return Err(crate::Error::Manifest(format!("manifest entry {entry:?} contains forbidden path components")));
+    }
+    Ok(())
+}
+
 /// Installs `plugin`, replacing one with the same id.
 pub fn install(mut plugin: Plugin) -> Arc<Plugin> {
+    let _ = validate_manifest_entry(plugin.manifest());
     plugin.set_serial(REVISION.fetch_add(1, Ordering::Relaxed) + 1);
     let p = Arc::new(plugin);
     PLUGINS.write().unwrap_or_else(|e| e.into_inner()).insert(p.id().to_string(), p.clone());
@@ -24,7 +38,9 @@ pub fn install(mut plugin: Plugin) -> Arc<Plugin> {
 
 /// Loads `bytes` with the default limits and installs the plug-in.
 pub fn install_bytes(bytes: &[u8]) -> Result<Arc<Plugin>> {
-    Ok(install(Plugin::load(bytes, Limits::default())?))
+    let plugin = Plugin::load(bytes, Limits::default())?;
+    validate_manifest_entry(plugin.manifest())?;
+    Ok(install(plugin))
 }
 
 pub fn get(id: &str) -> Option<Arc<Plugin>> {
@@ -69,6 +85,16 @@ pub fn intern(s: &str) -> &'static str {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn load_file(path: &std::path::Path, limits: Limits) -> Result<Plugin> {
     use std::io::Read;
+    let path_str = path.to_string_lossy();
+    if path_str.contains('\0') {
+        return Err(Error::Io(format!("{}: path contains null byte", path.display())));
+    }
+    if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return Err(Error::Io(format!("{}: path traversal is not permitted", path.display())));
+    }
+    if path_str.starts_with("\\\\") || path_str.starts_with("//") {
+        return Err(Error::Io(format!("{}: UNC paths are not permitted", path.display())));
+    }
     let meta = std::fs::metadata(path).map_err(|e| Error::Io(format!("{}: {e}", path.display())))?;
     if !meta.is_file() {
         return Err(Error::Io(format!("{} is not a file", path.display())));
@@ -79,7 +105,9 @@ pub fn load_file(path: &std::path::Path, limits: Limits) -> Result<Plugin> {
     let f = std::fs::File::open(path).map_err(|e| Error::Io(format!("{}: {e}", path.display())))?;
     let mut bytes = Vec::new();
     f.take(limits.max_module_bytes as u64 + 1).read_to_end(&mut bytes).map_err(|e| Error::Io(format!("{}: {e}", path.display())))?;
-    Ok(Plugin::load(&bytes, limits)?.with_source(path.display().to_string()))
+    let plugin = Plugin::load(&bytes, limits)?.with_source(path.display().to_string());
+    validate_manifest_entry(plugin.manifest())?;
+    Ok(plugin)
 }
 
 /// What [`load_folder`] did.
@@ -108,4 +136,31 @@ pub fn load_folder(dir: &std::path::Path) -> Result<FolderReport> {
         }
     }
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_manifest_entry_rejects_null_and_traversal() {
+        let mut m = crate::Manifest::placeholder();
+        m.entry = Some("normal/path.wasm".into());
+        assert!(validate_manifest_entry(&m).is_ok());
+
+        m.entry = Some("path\0with/null".into());
+        assert!(validate_manifest_entry(&m).is_err());
+
+        m.entry = Some("../parent.wasm".into());
+        assert!(validate_manifest_entry(&m).is_err());
+
+        m.entry = Some("/absolute/path.wasm".into());
+        assert!(validate_manifest_entry(&m).is_err());
+
+        #[cfg(windows)]
+        {
+            m.entry = Some("C:\\prefix\\path.wasm".into());
+            assert!(validate_manifest_entry(&m).is_err());
+        }
+    }
 }

@@ -29,18 +29,27 @@ impl Out {
     }
     /// Zeros up to the next multiple of `n` bytes.
     pub fn pad(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
         while !self.0.len().is_multiple_of(n) {
             self.0.push(0);
         }
     }
     /// Overwrite the `u32` at `at` (a size or count known only later).
     pub fn set_u32(&mut self, at: usize, v: u32) {
-        if let Some(b) = self.0.get_mut(at..at + 4) {
+        let Some(end) = at.checked_add(4) else {
+            return;
+        };
+        if let Some(b) = self.0.get_mut(at..end) {
             b.copy_from_slice(&v.to_le_bytes());
         }
     }
     pub fn set_i32(&mut self, at: usize, v: i32) {
-        if let Some(b) = self.0.get_mut(at..at + 4) {
+        let Some(end) = at.checked_add(4) else {
+            return;
+        };
+        if let Some(b) = self.0.get_mut(at..end) {
             b.copy_from_slice(&v.to_le_bytes());
         }
     }

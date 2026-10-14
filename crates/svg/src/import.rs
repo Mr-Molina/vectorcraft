@@ -175,6 +175,9 @@ impl RootUnits {
     }
 }
 
+/// Maximum group nesting depth during traversal.
+const MAX_GROUP_DEPTH: usize = 128;
+
 /// How many clip paths deep (`<clipPath clip-path>`) an object's clip is read.
 const MAX_CLIP_NEST: usize = 16;
 
@@ -453,7 +456,22 @@ fn hidden_objects(svg: &str, xml: &roxmltree::Document, css: &css::Styles, edits
 /// Where the start tag of element `n` ends its name (where an attribute can go).
 fn tag_name_end(svg: &str, n: XNode) -> usize {
     let start = n.range().start;
-    svg.get(start + 1..).and_then(|s| s.find(|c: char| c.is_whitespace() || c == '/' || c == '>')).map_or(start + 2, |i| start + 1 + i)
+    if !svg.is_char_boundary(start) {
+        return start;
+    }
+    let s = svg.get(start..).unwrap_or("");
+    let (s, offset) = if s.starts_with('<') {
+        let skip = if s.is_char_boundary(1) { 1 } else { 0 };
+        (s.get(skip..).unwrap_or(""), skip)
+    } else {
+        (s, 0)
+    };
+    if let Some(i) = s.find(|c: char| c.is_whitespace() || c == '/' || c == '>') {
+        return start + offset + i;
+    }
+    let fallback = if s.is_char_boundary(4) { s.get(4..).map_or(s.len(), |_| 4) } else { s.chars().next().map_or(0, char::len_utf8) };
+    let end = start + offset + fallback;
+    if svg.is_char_boundary(end) { end } else { start }
 }
 
 /// Make `n` link to `url`, unless it links somewhere already (an inner link wins).
@@ -578,14 +596,29 @@ impl Importer {
     }
 
     fn children(&mut self, g: &usvg::Group, acc: Affine) -> Vec<Arc<Node>> {
-        g.children().iter().filter_map(|c| self.node(c, acc)).map(Arc::new).collect()
+        self.children_depth(g, acc, 0)
+    }
+
+    fn children_depth(&mut self, g: &usvg::Group, acc: Affine, depth: usize) -> Vec<Arc<Node>> {
+        if depth >= MAX_GROUP_DEPTH {
+            self.warn(format!("groups nested more than {MAX_GROUP_DEPTH} deep: deeper elements ignored"));
+            return vec![];
+        }
+        g.children().iter().filter_map(|c| self.node_depth(c, acc, depth)).map(Arc::new).collect()
     }
 
     fn node(&mut self, n: &usvg::Node, acc: Affine) -> Option<Node> {
+        self.node_depth(n, acc, 0)
+    }
+
+    fn node_depth(&mut self, n: &usvg::Node, acc: Affine, depth: usize) -> Option<Node> {
+        if depth >= MAX_GROUP_DEPTH {
+            return None;
+        }
         let mut out = match n {
-            usvg::Node::Group(g) => self.group(g, acc),
+            usvg::Node::Group(g) => self.group_depth(g, acc, depth),
             usvg::Node::Path(p) => self.path(p, acc),
-            usvg::Node::Image(i) => self.image(i, acc),
+            usvg::Node::Image(i) => self.image_depth(i, acc, depth),
             // Only present when usvg had fonts; text is read from the XML instead.
             usvg::Node::Text(_) => None,
         }?;
@@ -615,11 +648,11 @@ impl Importer {
         n
     }
 
-    fn group(&mut self, g: &usvg::Group, acc: Affine) -> Option<Node> {
+    fn group_depth(&mut self, g: &usvg::Group, acc: Affine, depth: usize) -> Option<Node> {
         let url = self.links.get(g.id()).cloned();
-        let mut n = match self.instance(g, acc) {
+        let mut n = match self.instance_depth(g, acc, depth) {
             Some(n) => n,
-            None => self.group_node(g, acc)?,
+            None => self.group_node_depth(g, acc, depth)?,
         };
         if let Some(url) = url {
             link(&mut n, &url);
@@ -631,7 +664,10 @@ impl Importer {
     /// first `<use>`). `None` when the group has to be plain art: it shows the symbol differently
     /// (properties inherited from the `<use>`), or the canvas would paint the instance differently
     /// under its transform (see [`Reuse`]), or its viewport cuts the art, or it filters.
-    fn instance(&mut self, g: &usvg::Group, acc: Affine) -> Option<Node> {
+    fn instance_depth(&mut self, g: &usvg::Group, acc: Affine, depth: usize) -> Option<Node> {
+        if depth >= MAX_GROUP_DEPTH {
+            return None;
+        }
         let sym = self.uses.get(g.id())?.clone();
         if !g.filters().is_empty() {
             return None;
@@ -647,7 +683,7 @@ impl Importer {
             xf *= aff(s.transform());
             inner = s;
         }
-        let mut kids = self.children(inner, Affine::IDENTITY);
+        let mut kids = self.children_depth(inner, Affine::IDENTITY, depth + 1);
         let art = match kids.len() {
             0 => return None,
             1 => Arc::unwrap_or_clone(kids.pop()?),
@@ -671,7 +707,7 @@ impl Importer {
             }
         };
         let label = if made_up(g.id()) { "a symbol instance".to_string() } else { format!("'{}'", g.id()) };
-        let mask = g.mask().and_then(|m| self.opacity_mask(m, ts, &label));
+        let mask = g.mask().and_then(|m| self.opacity_mask_depth(m, ts, &label, depth + 1));
         let mut n = self.named(g.id(), NodeKind::SymbolInstance { symbol: name, xf });
         n.opacity = g.opacity().get();
         n.blend = blend(g.blend_mode());
@@ -701,6 +737,10 @@ impl Importer {
         let grow = text::size_scale(&obj, xf);
         // usvg resolved the `url(#…)` paints (the paths after the main one) in the element's user
         // space; runs paint in text space.
+        let det = obj.xf.determinant();
+        if !det.is_finite() || det.abs() <= 1e-9 {
+            return None;
+        }
         let to_text = Affine::scale(grow) * obj.xf.inverse();
         let slot_paint = |im: &mut Self, k: usize, m: Affine| match kids.get(main + 1 + k) {
             Some(usvg::Node::Path(p)) => p.fill().map_or(Paint::None, |f| {
@@ -742,7 +782,10 @@ impl Importer {
         Some(vec![Arc::new(n)])
     }
 
-    fn group_node(&mut self, g: &usvg::Group, acc: Affine) -> Option<Node> {
+    fn group_node_depth(&mut self, g: &usvg::Group, acc: Affine, depth: usize) -> Option<Node> {
+        if depth >= MAX_GROUP_DEPTH {
+            return None;
+        }
         let ts = acc * aff(g.transform());
         // A text placeholder becomes its text, named after the element (the group stays unnamed).
         let text = self.text(g, ts);
@@ -757,7 +800,7 @@ impl Importer {
             (None, "") => "a group".to_string(),
             (None, id) => format!("'{id}'"),
         };
-        let mask = g.mask().and_then(|m| self.opacity_mask(m, ts, &label));
+        let mask = g.mask().and_then(|m| self.opacity_mask_depth(m, ts, &label, depth + 1));
         // Blurs, shadows and glows become live effects (see [`fx`]).
         let effects = match g.filters() {
             [] => vec![],
@@ -768,7 +811,7 @@ impl Importer {
         };
         let mut children = match text {
             Some(t) => t,
-            None => self.children(g, ts),
+            None => self.children_depth(g, ts, depth + 1),
         };
         let mut n = if let Some(cp) = g.clip_path() {
             // SVG filters before it clips: the effects go on the art inside the clip.
@@ -788,8 +831,8 @@ impl Importer {
             // blends or masks before the effects). A text takes its own mask too.
             if (is_text || id.is_empty() && mask.is_none())
                 && children.len() == 1
-                && (g.blend_mode() == usvg::BlendMode::Normal || children[0].blend == BlendMode::Normal)
-                && (effects.is_empty() || children[0].blend == BlendMode::Normal && children[0].mask.is_none())
+                && (g.blend_mode() == usvg::BlendMode::Normal || children.first().is_some_and(|c| c.blend == BlendMode::Normal))
+                && (effects.is_empty() || children.first().is_some_and(|c| c.blend == BlendMode::Normal && c.mask.is_none()))
                 && let Some(only) = children.pop()
             {
                 let mut c = Arc::unwrap_or_clone(only);
@@ -818,7 +861,10 @@ impl Importer {
     /// `<mask>` → opacity mask (luminance; alpha masks are approximated by their luminance). A
     /// mask our export wrote gets its options back ([`mask_flags`]) and its art without what
     /// stands for them: the inverting filter group and the backdrop rectangle.
-    fn opacity_mask(&mut self, m: &usvg::Mask, ts: Affine, label: &str) -> Option<Box<vectorcraft_doc::OpacityMask>> {
+    fn opacity_mask_depth(&mut self, m: &usvg::Mask, ts: Affine, label: &str, depth: usize) -> Option<Box<vectorcraft_doc::OpacityMask>> {
+        if depth >= MAX_GROUP_DEPTH {
+            return None;
+        }
         if m.kind() == usvg::MaskType::Alpha {
             self.warn(format!("alpha mask on {label} imported as a luminance opacity mask"));
         }
@@ -838,7 +884,7 @@ impl Importer {
         {
             nodes = rest;
         }
-        let mut children: Vec<Arc<Node>> = nodes.iter().filter_map(|c| self.node(c, ts)).map(Arc::new).collect();
+        let mut children: Vec<Arc<Node>> = nodes.iter().filter_map(|c| self.node_depth(c, ts, depth + 1)).map(Arc::new).collect();
         let art = match children.len() {
             0 => return None,
             1 => Arc::unwrap_or_clone(children.pop()?),
@@ -1050,6 +1096,10 @@ impl Importer {
         if !p.is_visible() {
             return None;
         }
+        let det = acc.determinant();
+        if !det.is_finite() || det.abs() <= 1e-9 {
+            return None;
+        }
         let path = PathData::from_bezpath(&bezpath(p.data(), acc));
         if path.is_empty() {
             return None;
@@ -1075,7 +1125,7 @@ impl Importer {
         Some(n)
     }
 
-    fn image(&mut self, i: &usvg::Image, acc: Affine) -> Option<Node> {
+    fn image_depth(&mut self, i: &usvg::Image, acc: Affine, depth: usize) -> Option<Node> {
         if !i.is_visible() {
             return None;
         }
@@ -1084,7 +1134,7 @@ impl Importer {
             usvg::ImageKind::PNG(d) => (d, "image/png"),
             usvg::ImageKind::GIF(d) => (d, "image/gif"),
             usvg::ImageKind::WEBP(d) => (d, "image/webp"),
-            usvg::ImageKind::SVG(tree) => return self.svg_image(tree, acc),
+            usvg::ImageKind::SVG(tree) => return self.svg_image_depth(tree, acc, depth + 1),
         };
         let size = i.size();
         let (pw, ph) = image::ImageReader::new(std::io::Cursor::new(&bytes[..]))
@@ -1092,6 +1142,14 @@ impl Importer {
             .ok()
             .and_then(|r| r.into_dimensions().ok())
             .unwrap_or((size.width().round().max(1.0) as u32, size.height().round().max(1.0) as u32));
+        if pw == 0 || ph == 0 {
+            return None;
+        }
+        let sx = size.width() as f64 / pw as f64;
+        let sy = size.height() as f64 / ph as f64;
+        if !(sx.is_finite() && sx.abs() > 1e-9 && sy.is_finite() && sy.abs() > 1e-9) {
+            return None;
+        }
         let key = format!("img-{:016x}", fnv1a(bytes));
         // A linked file keeps a preview; a placeholder is all a missing one has (its preview).
         let linked = self.files.linked(i.kind());
@@ -1101,13 +1159,16 @@ impl Importer {
             let blob = ImageBlob { mime: mime.into(), bytes: bytes.clone(), proxy: missing.then(|| bytes.clone()) };
             if link.is_some() && !missing { blob.with_proxy() } else { blob }
         });
-        let xf = acc * Affine::scale_non_uniform(size.width() as f64 / pw as f64, size.height() as f64 / ph as f64);
+        let xf = acc * Affine::scale_non_uniform(sx, sy);
         Some(self.named(i.id(), NodeKind::Image(ImageObject { key, width: pw, height: ph, xf, link, placement: Default::default() })))
     }
 
     /// An SVG shown as an image (a data URL or a linked file) → its art, `acc` mapping its size.
     /// Its ids are its own: they mean nothing in the SVG around it.
-    fn svg_image(&mut self, tree: &usvg::Tree, acc: Affine) -> Option<Node> {
+    fn svg_image_depth(&mut self, tree: &usvg::Tree, acc: Affine, depth: usize) -> Option<Node> {
+        if depth >= MAX_GROUP_DEPTH {
+            return None;
+        }
         let outer = (
             std::mem::take(&mut self.links),
             std::mem::take(&mut self.hidden),
@@ -1115,7 +1176,7 @@ impl Importer {
             std::mem::take(&mut self.labels),
             std::mem::take(&mut self.non_scaling),
         );
-        let art = self.group_node(tree.root(), acc);
+        let art = self.group_node_depth(tree.root(), acc, depth + 1);
         (self.links, self.hidden, self.uses, self.labels, self.non_scaling) = outer;
         art
     }

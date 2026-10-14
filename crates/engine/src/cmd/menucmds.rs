@@ -283,11 +283,13 @@ fn about(o: Point, a: Affine) -> Affine {
 fn transform_each(s: &mut Session, p: &Value) -> Result<Value> {
     let roots = selected_roots(s)?;
     // Bounded so coordinates stay finite (and the document stays serializable).
-    let sh = f64_or(p, "scaleH", 100.0).clamp(-100_000.0, 100_000.0);
-    let sv = f64_or(p, "scaleV", 100.0).clamp(-100_000.0, 100_000.0);
-    let mh = f64_or(p, "moveH", 0.0).clamp(-1.0e7, 1.0e7);
-    let mv = f64_or(p, "moveV", 0.0).clamp(-1.0e7, 1.0e7);
-    let rot = f64_or(p, "rotate", 0.0);
+    let sh = p.get("scaleH").or_else(|| p.get("sx")).and_then(Value::as_f64).filter(|v| v.is_finite()).unwrap_or(100.0).clamp(-100_000.0, 100_000.0);
+    let sv = p.get("scaleV").or_else(|| p.get("sy")).and_then(Value::as_f64).filter(|v| v.is_finite()).unwrap_or(100.0).clamp(-100_000.0, 100_000.0);
+    let mh = p.get("moveH").or_else(|| p.get("dx")).and_then(Value::as_f64).filter(|v| v.is_finite()).unwrap_or(0.0).clamp(-1.0e7, 1.0e7);
+    let mv = p.get("moveV").or_else(|| p.get("dy")).and_then(Value::as_f64).filter(|v| v.is_finite()).unwrap_or(0.0).clamp(-1.0e7, 1.0e7);
+    let rot = p.get("rotate").or_else(|| p.get("deg")).and_then(Value::as_f64).filter(|v| v.is_finite()).unwrap_or(0.0).clamp(-1.0e7, 1.0e7);
+    let px = p.get("px").and_then(Value::as_f64).filter(|v| v.is_finite());
+    let py = p.get("py").and_then(Value::as_f64).filter(|v| v.is_finite());
     let rx = bool_or(p, "reflectX", false);
     let ry = bool_or(p, "reflectY", false);
     let random = bool_or(p, "random", false);
@@ -311,7 +313,7 @@ fn transform_each(s: &mut Session, p: &Value) -> Result<Value> {
                 k_mv = mv * (rng.next() * 2.0 - 1.0);
                 k_rot = rot * (rng.next() * 2.0 - 1.0);
             }
-            let o = vectorcraft_geom::reference_point(b, refi);
+            let o = if let (Some(x), Some(y)) = (px, py) { Point::new(x, y) } else { vectorcraft_geom::reference_point(b, refi) };
             let refl = Affine::scale_non_uniform(if ry { -1.0 } else { 1.0 }, if rx { -1.0 } else { 1.0 });
             let m = Affine::translate((k_mh, k_mv))
                 * about(o, Affine::rotate(-k_rot.to_radians()) * refl * Affine::scale_non_uniform(k_sh / 100.0, k_sv / 100.0));
@@ -350,6 +352,26 @@ pub(crate) fn unique_key(d: &vectorcraft_doc::Document, stem: &str) -> String {
     }
 }
 
+/// Fails unless `region` rendered at `scale` is a valid, positive, finite size whose pixel
+/// dimensions — computed exactly as the renderer does ([`vectorcraft_render::region_pixels`]) —
+/// stay within [`MAX_PIXELS`] and [`vectorcraft_render::MAX_RASTER_SIDE`] px a side. Inverted, empty or non-finite regions (and
+/// finite bounds whose width overflows to infinity) are rejected before the size check.
+pub(crate) fn check_raster_size(region: Rect, scale: f64) -> Result<()> {
+    let (w, h) = (region.width(), region.height());
+    let valid = [w, h, scale, w * scale, h * scale].iter().all(|v| v.is_finite() && *v > 0.0);
+    if !valid {
+        return Err(EngineError::Other("image would be too large; lower the resolution".into()));
+    }
+    let (w_px, h_px) = vectorcraft_render::region_pixels(region, scale);
+    if u64::from(w_px) * u64::from(h_px) > MAX_PIXELS as u64
+        || w_px > vectorcraft_render::MAX_RASTER_SIDE
+        || h_px > vectorcraft_render::MAX_RASTER_SIDE
+    {
+        return Err(EngineError::Other("image would be too large; lower the resolution".into()));
+    }
+    Ok(())
+}
+
 /// `doc` rendered over `region` with `opts` as a PNG in colour model `color`.
 fn render_png(
     doc: &vectorcraft_doc::Document,
@@ -358,9 +380,7 @@ fn render_png(
     opts: &vectorcraft_render::RenderOptions,
     color: RasterColorModel,
 ) -> Result<(Vec<u8>, u32, u32)> {
-    if region.width() * region.height() * scale * scale > MAX_PIXELS || region.width() * scale > 65535.0 || region.height() * scale > 65535.0 {
-        return Err(EngineError::Other("image would be too large; lower the resolution".into()));
-    }
+    check_raster_size(region, scale)?;
     let mut r = vectorcraft_render::Renderer::new();
     let mut img = r.render_region_with(doc, region, scale, opts);
     RasterEffectsSettings { color_model: color, ..Default::default() }.finish_pixels(&mut img.pixels);
@@ -778,8 +798,8 @@ fn convert_to_artboards(s: &mut Session, _: &Value) -> Result<Value> {
 
 fn rearrange_artboards(s: &mut Session, p: &Value) -> Result<Value> {
     let n_ab = s.doc()?.doc.artboards.len().max(1);
-    let cols = (f64_or(p, "columns", 2.0).clamp(1.0, n_ab as f64)) as usize;
-    let spacing = f64_or(p, "spacing", 20.0).clamp(-1.0e5, 1.0e5);
+    let cols = (p.get("columns").and_then(Value::as_f64).filter(|v| v.is_finite()).unwrap_or(2.0).clamp(1.0, n_ab as f64)) as usize;
+    let spacing = p.get("spacing").and_then(Value::as_f64).filter(|v| v.is_finite()).unwrap_or(20.0).clamp(-1.0e5, 1.0e5);
     let by_col = bool_or(p, "byColumn", false);
     let move_art = bool_or(p, "moveArtwork", true);
     let locked_and_hidden = s.prefs.move_locked_with_artboard;

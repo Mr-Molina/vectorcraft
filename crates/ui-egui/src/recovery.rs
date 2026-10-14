@@ -105,11 +105,27 @@ fn write(app: &mut VectorcraftApp, store: &Arc<dyn RecoveryStore>, pick: impl Fn
     for job in jobs {
         let (uid, label, title) = (job.uid, format!("Saving recovery data for {}", job.title), job.title.clone());
         let (done, store) = (job.clone(), store.clone());
-        let work = move |_: Writer| job.write(store.as_ref());
+        let saved_at_start = app.session.document(uid).map(|st| st.saved_snapshot());
+        let store_work = store.clone();
+        let work = move |_: Writer| job.write(store_work.as_ref());
         let then = move |app: &mut VectorcraftApp, r: Result<Value, String>| {
             let r = r?;
-            done.finish(&mut app.session);
-            app.status(format!("Saved recovery data for {title}"));
+            let (is_dirty, saved_changed) = app.session.document(uid).map_or((false, false), |st| {
+                let saved_changed = match &saved_at_start {
+                    Some(start) => !Arc::ptr_eq(start, &st.saved_snapshot()),
+                    None => false,
+                };
+                (st.is_dirty(), saved_changed)
+            });
+            if !is_dirty || saved_changed {
+                let _ = store.remove(&format!("{}.vectorcraft", done.file));
+                let _ = store.remove(&format!("{}.json", done.file));
+                recovery::forget(&mut app.session, uid);
+                recovery::forget_clean(&mut app.session);
+            } else {
+                done.finish(&mut app.session);
+                app.status(format!("Saved recovery data for {title}"));
+            }
             Ok(r)
         };
         // Its own store, not the file writer: this only decides whether it runs on the worker.

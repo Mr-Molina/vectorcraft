@@ -1,0 +1,287 @@
+bf1811d4 feat(engine): implement imageTrace.setView and preview undo coalescing
+ crates/engine/src/cmd/buildcmds.rs | 42 +++++++++++++++-
+ crates/engine/src/tests_build.rs   | 99 ++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 139 insertions(+), 2 deletions(-)
+diff --git a/crates/engine/src/cmd/buildcmds.rs b/crates/engine/src/cmd/buildcmds.rs
+index 30745fa2..0e8dabfb 100644
+--- a/crates/engine/src/cmd/buildcmds.rs
++++ b/crates/engine/src/cmd/buildcmds.rs
+@@ -8,21 +8,21 @@
+ //!
+ //! **Image Trace** makes a group named "Image Trace" holding the source image (hidden, bottom)
+ //! and the traced filled paths above it, mapped with the image's transform. Expand drops the
+ //! image (a plain group of paths remains); Release puts the image back in place of the group.
+ 
+ use std::sync::Arc;
+ 
+ use serde_json::{Value, json};
+ use vectorcraft_color::{Color, Paint};
+ use vectorcraft_doc::appearance::{AppearanceItem, FillLayer, StrokeLayer};
+-use vectorcraft_doc::{Appearance, Document, Node, NodeId, NodeKind, Selection};
++use vectorcraft_doc::{Appearance, Document, Node, NodeId, NodeKind, Selection, TraceView};
+ use vectorcraft_geom::{FillRule, PathData, Point, Rect, SubPath};
+ use vectorcraft_pathops as po;
+ use vectorcraft_tools::builder::{
+     self as b, BuilderMap, EDGE_NAME, FACE_NAME, LIVE_PAINT_NAME, SOURCES_NAME, Touched, edge_near, face_at, is_live_paint, sample_polyline,
+     sorted_roots,
+ };
+ use vectorcraft_trace as tr;
+ 
+ use super::edit::selected_roots;
+ use super::paint::paint_from;
+@@ -144,20 +144,29 @@ pub fn specs() -> Vec<CommandSpec> {
+         ),
+         cmd!(
+             "imageTrace.expand",
+             "Expand",
+             ["Object", "Image Trace"],
+             None,
+             "{id?} keep only the traced paths (drop the source image) → {ids}",
+             has_selection_or_ids,
+             trace_expand
+         ),
++        cmd!(
++            "imageTrace.setView",
++            "View",
++            ["Object", "Image Trace"],
++            None,
++            "{id?: NodeId, view: \"tracingResult\"|\"tracingResultWithOutlines\"|\"outlines\"|\"outlinesWithSource\"|\"sourceImage\"} set Image Trace display mode",
++            has_selection_or_ids,
++            trace_set_view
++        ),
+         cmd!(query "imageTrace.presets", "Image Trace Presets", [], None, "{} → {presets: [{name, params}]}", always, |_, _| {
+             Ok(json!({ "presets": tr::presets().into_iter().map(|(n, p)| json!({ "name": n, "params": p })).collect::<Vec<_>>() }))
+         }),
+     ]
+ }
+ 
+ fn has_selection_or_ids(s: &Session) -> std::result::Result<(), String> {
+     // Agents may pass ids explicitly; menus need a selection. Accept either (params are checked in run).
+     has_doc(s)
+ }
+@@ -640,20 +649,24 @@ fn trace_params(p: &Value) -> Result<tr::TraceParams> {
+     serde_json::from_value(v).map_err(|e| bad("imageTrace.make", e.to_string()))
+ }
+ 
+ /// The most anchor points an Image Trace may make: a photo traced at high fidelity can make
+ /// millions, more than the canvas draws smoothly or a laptop has memory for, so the trace is
+ /// refused with advice instead (#525).
+ pub const MAX_TRACE_ANCHORS: usize = 2_000_000;
+ 
+ fn trace_make(s: &mut Session, p: &Value, expand: bool) -> Result<Value> {
+     const C: &str = "imageTrace.make";
++    let preview = p.get("preview").and_then(Value::as_bool).unwrap_or(false);
++    if preview && s.active().is_some_and(|st| st.undo_group.is_none()) {
++        s.begin_undo_group();
++    }
+     let params = trace_params(p)?;
+     let params_json = serde_json::to_value(&params).map_err(|e| EngineError::Other(e.to_string()))?;
+     // The preset's name if the parameters are exactly that preset's, else "Custom".
+     let named = str_param(p, "preset").unwrap_or("Default");
+     let preset_label = match tr::preset(named) {
+         Some(b) if serde_json::to_value(&b).ok().as_ref() == Some(&params_json) => named.to_string(),
+         _ => "Custom".to_string(),
+     };
+     let roots = root_ids(s, p)?;
+     // The image (inside a trace group, or selected directly).
+@@ -667,20 +680,23 @@ fn trace_make(s: &mut Session, p: &Value, expand: bool) -> Result<Value> {
+                     NodeKind::Image(i) => Some((*r, i.clone())),
+                     _ if is_trace_group(n) => match &n.children()?.first()?.kind {
+                         NodeKind::Image(i) => Some((*r, i.clone())),
+                         _ => None,
+                     },
+                     _ => None,
+                 }
+             })
+             .ok_or_else(|| bad(C, "select an image (or an Image Trace group)"))?
+     };
++    let view_override: Option<TraceView> = p.get("view").and_then(|v| serde_json::from_value(v.clone()).ok());
++    let existing_view = s.doc()?.doc.node(target).map(|n| n.trace_view()).unwrap_or_default();
++    let active_view = view_override.unwrap_or(existing_view);
+     let blob = s.doc()?.doc.images.get(&img.key).ok_or_else(|| EngineError::Other(format!("image data `{}` is missing", img.key)))?;
+     let raster = tr::Raster::decode(&blob.bytes).map_err(|e| EngineError::Other(e.to_string()))?;
+     let res = tr::trace_within(&raster, &params, MAX_TRACE_ANCHORS).map_err(|e| EngineError::Other(e.to_string()))?;
+     // Pixel space of the decoded raster → the image object's pixel space → document.
+     let sx = img.width.max(1) as f64 / raster.width.max(1) as f64;
+     let sy = img.height.max(1) as f64 / raster.height.max(1) as f64;
+     let xf = img.xf * vectorcraft_geom::Affine::scale_non_uniform(sx, sy);
+     let (npaths, anchors, colors) = (res.paths.len(), res.anchor_count(), res.palette.len());
+     let label = if expand { "Image Trace (Make and Expand)" } else { "Image Trace" };
+     let id = s.edit(label, |d, sel| {
+@@ -703,28 +719,35 @@ fn trace_make(s: &mut Session, p: &Value, expand: bool) -> Result<Value> {
+         for tp in res.paths {
+             let path = tp.path.transformed(xf);
+             let mut n = shape_node(d, path, None);
+             n.appearance = fill_only(Paint::solid(Color::rgb8(tp.color[0], tp.color[1], tp.color[2])));
+             children.push(Arc::new(n));
+         }
+         let gid = d.alloc_id();
+         let mut g = Node::group(gid, children);
+         g.name = if expand { None } else { Some(TRACE_NAME.into()) };
+         if !expand {
+-            g.trace = Some(Box::new(json!({ "preset": preset_label, "params": params_json })));
++            let mut trace_meta = json!({ "preset": preset_label, "params": params_json });
++            if let Ok(v) = serde_json::to_value(active_view) {
++                trace_meta["view"] = v;
++            }
++            g.trace = Some(Box::new(trace_meta));
+         }
+         let (par, idx, _) = d.position(target).ok_or(EngineError::NoNode(target))?;
+         d.remove(target)?;
+         d.insert(par, idx, g)?;
+         sel.set([gid]);
+         Ok(gid)
+     })?;
++    if !preview && s.active().is_some_and(|st| st.undo_group.is_some()) {
++        s.end_undo_group(false);
++    }
+     Ok(json!({ "id": id.0, "paths": npaths, "anchors": anchors, "colors": colors }))
+ }
+ 
+ fn trace_targets(s: &Session, p: &Value) -> Result<Vec<NodeId>> {
+     let d = &s.doc()?.doc;
+     let v: Vec<NodeId> = root_ids(s, p)?.into_iter().filter(|i| d.node(*i).is_some_and(is_trace_group)).collect();
+     if v.is_empty() {
+         return Err(EngineError::Other("select an Image Trace object".into()));
+     }
+     Ok(v)
+@@ -755,10 +778,25 @@ fn trace_expand(s: &mut Session, p: &Value) -> Result<Value> {
+             n.trace = None;
+             if let Some(ch) = n.children_mut() {
+                 ch.retain(|c| !matches!(c.kind, NodeKind::Image(_)));
+             }
+         }
+         sel.set(targets.iter().copied());
+         Ok(())
+     })?;
+     Ok(json!({ "ids": ids_json(&targets) }))
+ }
++
++fn trace_set_view(s: &mut Session, p: &Value) -> Result<Value> {
++    const C: &str = "imageTrace.setView";
++    let view_str = str_param(p, "view").ok_or_else(|| bad(C, "missing view"))?;
++    let view: TraceView = serde_json::from_value(json!(view_str)).map_err(|e| bad(C, format!("unknown view `{view_str}`: {e}")))?;
++    let targets = trace_targets(s, p)?;
++    s.edit("Image Trace View Mode", |d, _| {
++        for id in &targets {
++            let n = d.node_mut(*id).ok_or(EngineError::NoNode(*id))?;
++            n.set_trace_view(view);
++        }
++        Ok(())
++    })?;
++    Ok(json!({ "ids": ids_json(&targets), "view": view_str }))
++}
+diff --git a/crates/engine/src/tests_build.rs b/crates/engine/src/tests_build.rs
+index 04af2e0b..44b45072 100644
+--- a/crates/engine/src/tests_build.rs
++++ b/crates/engine/src/tests_build.rs
+@@ -697,10 +697,109 @@ fn image_trace_object_remembers_its_settings() {
+     let d = s.doc().unwrap().doc.clone();
+     let back = vectorcraft_format::load(&vectorcraft_format::save(&d, false)).unwrap();
+     let t = back.node(g).unwrap().trace.clone().unwrap();
+     assert_eq!((t["preset"].as_str(), t["params"]["colors"].as_u64()), (Some("Custom"), Some(9)));
+     // Expanded traces are plain groups.
+     s.execute("imageTrace.expand", &json!({})).unwrap();
+     let st = s.doc().unwrap();
+     let id = st.selection.in_paint_order(&st.doc)[0];
+     assert!(st.doc.node(id).unwrap().trace.is_none());
+ }
++
++#[test]
++fn test_image_trace_set_view_and_expand_invariants() {
++    let mut s = session();
++    let img = image_doc(&mut s);
++    let r = s.execute("imageTrace.make", &json!({"params": {"ignoreWhite": true}})).unwrap();
++    let trace_id = NodeId(r["id"].as_u64().unwrap());
++    assert_ne!(trace_id, img);
++
++    // For each mode, run imageTrace.setView, asserting doc.node(trace_id).unwrap().trace_view()
++    let modes = [
++        ("tracingResultWithOutlines", vectorcraft_doc::TraceView::TracingResultWithOutlines),
++        ("outlines", vectorcraft_doc::TraceView::Outlines),
++        ("outlinesWithSource", vectorcraft_doc::TraceView::OutlinesWithSource),
++        ("sourceImage", vectorcraft_doc::TraceView::SourceImage),
++        ("tracingResult", vectorcraft_doc::TraceView::TracingResult),
++    ];
++    for (mode_str, expected_view) in modes {
++        let res = s.execute("imageTrace.setView", &json!({"id": trace_id.0, "view": mode_str})).unwrap();
++        assert_eq!(res["view"], mode_str);
++        let n = s.doc().unwrap().doc.node(trace_id).unwrap();
++        assert_eq!(n.trace_view(), expected_view);
++    }
++
++    // Non-trace validation (Review Focus 2): Create shape.rectangle, call imageTrace.setView on it,
++    // assert error containing "select an Image Trace object".
++    let rect_id = rect(&mut s, 10.0, 10.0, 50.0, 50.0);
++    let err = s.execute("imageTrace.setView", &json!({"id": rect_id.0, "view": "outlines"})).unwrap_err();
++    assert!(err.to_string().contains("select an Image Trace object"), "err: {err}");
++
++    s.execute("select.set", &json!({"ids": [rect_id.0]})).unwrap();
++    let err_sel = s.execute("imageTrace.setView", &json!({"view": "outlines"})).unwrap_err();
++    assert!(err_sel.to_string().contains("select an Image Trace object"), "err: {err_sel}");
++
++    // Expand invariant (Review Focus 3): Switch trace to outlines, call imageTrace.expand,
++    // assert expanded.trace.is_none(), expanded.name.is_none(), children non-empty with !c.appearance.fill_paint().is_none().
++    s.execute("imageTrace.setView", &json!({"id": trace_id.0, "view": "outlines"})).unwrap();
++    assert_eq!(s.doc().unwrap().doc.node(trace_id).unwrap().trace_view(), vectorcraft_doc::TraceView::Outlines);
++    s.execute("imageTrace.expand", &json!({"id": trace_id.0})).unwrap();
++    let expanded = s.doc().unwrap().doc.node(trace_id).unwrap();
++    assert!(expanded.trace.is_none());
++    assert!(expanded.name.is_none());
++    let children = expanded.children().unwrap();
++    assert!(!children.is_empty());
++    assert!(children.iter().all(|c| !matches!(c.kind, NodeKind::Image(_))));
++    assert!(children.iter().all(|c| !c.appearance.fill_paint().is_none()));
++}
++
++#[test]
++fn test_image_trace_preview_coalescing() {
++    let mut s = session();
++    let img = image_doc(&mut s);
++    let initial_count = s.doc().unwrap().history.undo.len();
++
++    // Select image
++    s.execute("select.set", &json!({"ids": [img.0]})).unwrap();
++
++    // Emulate 4 rapid preview drag frames (preview: true with changing threshold)
++    let mut trace_id = img;
++    for th in [64, 96, 128, 160] {
++        let r = s
++            .execute(
++                "imageTrace.make",
++                &json!({
++                    "id": trace_id.0,
++                    "preview": true,
++                    "params": { "threshold": th }
++                }),
++            )
++            .unwrap();
++        trace_id = NodeId(r["id"].as_u64().unwrap());
++    }
++
++    // Commit final drag release with preview: false
++    let r = s
++        .execute(
++            "imageTrace.make",
++            &json!({
++                "id": trace_id.0,
++                "preview": false,
++                "params": { "threshold": 192 }
++            }),
++        )
++        .unwrap();
++    let final_trace_id = NodeId(r["id"].as_u64().unwrap());
++
++    // Assert s.doc().unwrap().history.undo.len() == initial_count + 1
++    assert_eq!(s.doc().unwrap().history.undo.len(), initial_count + 1, "all preview frames coalesced into 1 undo step");
++
++    // Run edit.undo once, assert doc node reverts to original image
++    s.execute("edit.undo", &json!({})).unwrap();
++    assert_eq!(s.doc().unwrap().history.undo.len(), initial_count);
++
++    let doc = &s.doc().unwrap().doc;
++    assert!(doc.node(final_trace_id).is_none() || final_trace_id == img);
++    let orig = doc.node(img).expect("original image restored");
++    assert!(matches!(orig.kind, NodeKind::Image(_)));
++    assert!(orig.visible);
++}

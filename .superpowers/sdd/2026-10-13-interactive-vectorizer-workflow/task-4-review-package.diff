@@ -1,0 +1,275 @@
+diff --git a/crates/ui-egui/src/panels/image_trace.rs b/crates/ui-egui/src/panels/image_trace.rs
+index bda45ab0..1b4fc86d 100644
+--- a/crates/ui-egui/src/panels/image_trace.rs
++++ b/crates/ui-egui/src/panels/image_trace.rs
+@@ -12,8 +12,16 @@ use crate::widgets::{self, menu_item};
+ 
+ const MODES: [(&str, &str); 3] = [("blackAndWhite", "Black and White"), ("grayscale", "Grayscale"), ("color", "Color")];
+ 
+-/// Panel state: the preset name, the current parameters and the last result's counts.
+-#[derive(Clone, Default)]
++pub(crate) const VIEW_MODES: [(&str, &str); 5] = [
++    ("tracingResult", "Tracing Result"),
++    ("tracingResultWithOutlines", "Tracing Result with Outlines"),
++    ("outlines", "Outlines"),
++    ("outlinesWithSource", "Outlines with Source Image"),
++    ("sourceImage", "Source Image"),
++];
++
++/// Panel state: the preset name, the current parameters, the last result's counts, and view/preview settings.
++#[derive(Clone)]
+ struct TraceUi {
+     preset: String,
+     params: Value,
+@@ -21,6 +29,23 @@ struct TraceUi {
+     /// The selected Image Trace object's stored settings last adopted (so edits in progress
+     /// aren't overwritten until the object changes).
+     synced: Value,
++    view: String,
++    preview: bool,
++    last_drag_time: f64,
++}
++
++impl Default for TraceUi {
++    fn default() -> Self {
++        Self {
++            preset: String::new(),
++            params: Value::Null,
++            info: None,
++            synced: Value::Null,
++            view: "tracingResult".into(),
++            preview: true,
++            last_drag_time: 0.0,
++        }
++    }
+ }
+ 
+ fn presets(app: &mut VectorcraftApp) -> Vec<(String, Value)> {
+@@ -52,6 +77,14 @@ pub(crate) fn selected_preset(app: &VectorcraftApp) -> Option<String> {
+     Some(n.trace.as_ref().and_then(|t| t["preset"].as_str()).unwrap_or("Custom").to_string())
+ }
+ 
++/// The view mode of the one selected Image Trace object.
++pub(crate) fn selected_view(app: &VectorcraftApp) -> Option<String> {
++    let st = app.session.active()?;
++    let [id] = st.selection.objects[..] else { return None };
++    let n = st.doc.node(id).filter(|n| is_trace(n))?;
++    serde_json::to_value(n.trace_view()).ok()?.as_str().map(ToString::to_string)
++}
++
+ /// Trace the selected image, or trace the selected Image Trace object again, with built-in `preset`.
+ fn trace_with(app: &mut VectorcraftApp, preset: &str) {
+     // A failure is reported in the status bar.
+@@ -94,12 +127,25 @@ pub(crate) fn preset_dropdown(app: &mut VectorcraftApp, ui: &mut Ui, current: &s
+     }
+ }
+ 
+-/// The Control bar for one selected Image Trace object: its preset, the Image Trace panel and
++/// Dropdown to select the active Image Trace View mode.
++pub(crate) fn view_dropdown(app: &mut VectorcraftApp, ui: &mut Ui, current: &str, width: f32) {
++    let current_label = VIEW_MODES.iter().find(|m| m.0 == current).map_or("Tracing Result", |m| m.1);
++    let labels: Vec<&str> = VIEW_MODES.iter().map(|m| m.1).collect();
++    if let Some(i) = widgets::dropdown(ui, "trace-view-mode", current_label, &labels, width) {
++        let chosen = VIEW_MODES[i].0;
++        let _ = app.run("imageTrace.setView", json!({ "view": chosen }));
++    }
++}
++
++/// The Control bar for one selected Image Trace object: its preset, view mode, the Image Trace panel and
+ /// Expand. Whether it is one.
+ pub fn control_bar(app: &mut VectorcraftApp, ui: &mut Ui) -> bool {
+     let Some(preset) = selected_preset(app) else { return false };
+     widgets::dim_label(ui, tl!("Preset:"));
+-    preset_dropdown(app, ui, &preset, 150.0);
++    preset_dropdown(app, ui, &preset, 130.0);
++    let view = selected_view(app).unwrap_or_else(|| "tracingResult".into());
++    widgets::dim_label(ui, tl!("View:"));
++    view_dropdown(app, ui, &view, 140.0);
+     if widgets::icon_button(ui, "image", tl!("Image Trace"), false, 24.0).clicked() {
+         app.ui.open_panel = Some("imageTrace".into());
+     }
+@@ -110,9 +156,9 @@ pub fn control_bar(app: &mut VectorcraftApp, ui: &mut Ui) -> bool {
+     true
+ }
+ 
+-fn trace(app: &mut VectorcraftApp, st: &mut TraceUi) {
++fn trace(app: &mut VectorcraftApp, st: &mut TraceUi, preview: bool) {
+     let preset = if st.preset == "Custom" { "Default" } else { st.preset.as_str() };
+-    match app.run("imageTrace.make", json!({ "preset": preset, "params": st.params })) {
++    match app.run("imageTrace.make", json!({ "preset": preset, "params": st.params, "preview": preview })) {
+         Ok(r) => st.info = Some((r["paths"].as_u64().unwrap_or(0), r["anchors"].as_u64().unwrap_or(0), r["colors"].as_u64().unwrap_or(0))),
+         Err(e) => app.ui.status = e,
+     }
+@@ -143,6 +189,9 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
+     if let Some(t) = stored.filter(|t| *t != st.synced) {
+         st.preset = t["preset"].as_str().unwrap_or("Custom").to_string();
+         st.params = t["params"].clone();
++        if let Some(v) = t.get("view").and_then(Value::as_str) {
++            st.view = v.to_string();
++        }
+         st.synced = t;
+     }
+     let mut retrace = false;
+@@ -156,6 +205,17 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
+             retrace = true;
+         }
+     });
++    ui.horizontal(|ui| {
++        widgets::dim_label(ui, tl!("View:"));
++        view_dropdown(app, ui, &st.view, 140.0);
++        // Eyeball toggle button for quick source inspection
++        let is_source = st.view == "sourceImage";
++        if widgets::icon_button(ui, "eye", tl!("View Source Image"), is_source, 22.0).clicked() {
++            let new_view = if is_source { "tracingResult" } else { "sourceImage" };
++            st.view = new_view.to_string();
++            let _ = app.run("imageTrace.setView", json!({ "view": new_view }));
++        }
++    });
+     ui.horizontal(|ui| {
+         widgets::dim_label(ui, tl!("Mode:"));
+         let mode = st.params["mode"].as_str().unwrap_or("blackAndWhite").to_string();
+@@ -175,11 +235,18 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
+     };
+     let mut v = st.params[key].as_f64().unwrap_or(0.0);
+     let (changed, release) = slider(ui, label, &mut v, range, "");
++    let now = ui.input(|i| i.time);
+     if changed {
+         st.params[key] = json!(v.round() as u64);
+         st.preset = "Custom".into();
++        if st.preview && is_trace && now - st.last_drag_time >= 0.060 {
++            st.last_drag_time = now;
++            trace(app, &mut st, true);
++        }
++    }
++    if release && is_trace {
++        trace(app, &mut st, false);
+     }
+-    retrace |= release;
+ 
+     let open: bool = !pstate::<bool>(ui.ctx(), "it-advanced-closed");
+     if ui.add(egui::Button::new(format!("{} {}", if open { "▾" } else { "▸" }, tl!("Advanced"))).frame(false)).clicked() {
+@@ -191,11 +258,18 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
+         {
+             let mut v = st.params[key].as_f64().unwrap_or(0.0);
+             let (changed, release) = slider(ui, label, &mut v, range, suffix);
++            let now = ui.input(|i| i.time);
+             if changed {
+                 st.params[key] = if key == "noise" { json!(v.round() as u64) } else { json!(v.round()) };
+                 st.preset = "Custom".into();
++                if st.preview && is_trace && now - st.last_drag_time >= 0.060 {
++                    st.last_drag_time = now;
++                    trace(app, &mut st, true);
++                }
++            }
++            if release && is_trace {
++                trace(app, &mut st, false);
+             }
+-            retrace |= release;
+         }
+         ui.horizontal(|ui| {
+             widgets::dim_label(ui, tl!("Method:"));
+@@ -227,16 +301,19 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
+         );
+     }
+     ui.horizontal(|ui| {
++        if widgets::check(ui, tl!("Preview"), st.preview, true) {
++            st.preview = !st.preview;
++        }
+         let r = ui.add_enabled_ui(is_trace || is_image, |ui| widgets::flat_button(ui, tl!("Trace"), 80.0)).inner;
+         if r.on_disabled_hover_text(tl!("Select an image to trace")).clicked() {
+-            trace(app, &mut st);
++            trace(app, &mut st, false);
+         }
+         if ui.add_enabled_ui(is_trace, |ui| widgets::flat_button(ui, tl!("Expand"), 80.0)).inner.clicked() {
+             app.run("imageTrace.expand", json!({})).ok();
+         }
+     });
+     if retrace && is_trace {
+-        trace(app, &mut st);
++        trace(app, &mut st, false);
+     }
+     set_pstate(ui.ctx(), "image-trace", st);
+ }
+@@ -273,4 +350,58 @@ mod tests {
+             out.textures_delta.clear();
+         }
+     }
++
++    #[test]
++    fn test_image_trace_panel_with_view_modes_headless() {
++        let mut app = VectorcraftApp::new(vectorcraft_engine::Session::new(), Default::default());
++        app.session.execute("file.new", &json!({"width": 200, "height": 200})).unwrap();
++
++        let img = image::RgbaImage::from_fn(20, 20, |x, y| image::Rgba([x as u8, y as u8, 0, 255]));
++        let mut png = Vec::new();
++        img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
++
++        let _img_id = app
++            .session
++            .edit("img", |d, sel| {
++                d.images.insert("img1".into(), vectorcraft_doc::ImageBlob::new("image/png", png));
++                let id = d.alloc_id();
++                let l = d.default_layer();
++                d.insert(
++                    l,
++                    0,
++                    vectorcraft_doc::Node::new(
++                        id,
++                        vectorcraft_doc::NodeKind::Image(vectorcraft_doc::ImageObject {
++                            key: "img1".into(),
++                            width: 20,
++                            height: 20,
++                            xf: vectorcraft_geom::Affine::IDENTITY,
++                            link: None,
++                            placement: Default::default(),
++                        }),
++                    ),
++                )?;
++                sel.set([id]);
++                Ok(id)
++            })
++            .unwrap();
++
++        let trace_res = app.session.execute("imageTrace.make", &json!({ "preset": "Default" })).unwrap();
++        let trace_id = vectorcraft_doc::NodeId(trace_res["id"].as_u64().unwrap());
++        app.session.select(|_, sel| sel.set([trace_id])).unwrap();
++
++        assert_eq!(selected_view(&app), Some("tracingResult".to_string()));
++        app.run("imageTrace.setView", json!({ "view": "outlines" })).unwrap();
++        assert_eq!(selected_view(&app), Some("outlines".to_string()));
++
++        for _ in 0..3 {
++            let ctx = egui::Context::default();
++            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
++                show(&mut app, ui);
++                menu(&mut app, ui);
++                control_bar(&mut app, ui);
++            });
++            out.textures_delta.clear();
++        }
++    }
+ }
+diff --git a/crates/ui-egui/src/panels/properties.rs b/crates/ui-egui/src/panels/properties.rs
+index 158e3317..6e3b8e42 100644
+--- a/crates/ui-egui/src/panels/properties.rs
++++ b/crates/ui-egui/src/panels/properties.rs
+@@ -155,13 +155,18 @@ fn image_section(app: &mut VectorcraftApp, ui: &mut Ui) {
+ }
+ 
+ /// The one selected Image Trace object: its preset (choosing another traces it again with that
+-/// one), Expand and Release.
++/// one), view mode, Expand and Release.
+ fn trace_section(app: &mut VectorcraftApp, ui: &mut Ui, preset: &str) {
+     section_header(ui, tl!("Image Trace"));
+     ui.horizontal(|ui| {
+         dim_label(ui, tl!("Preset:"));
+         crate::panels::image_trace::preset_dropdown(app, ui, preset, ui.available_width());
+     });
++    let view = crate::panels::image_trace::selected_view(app).unwrap_or_else(|| "tracingResult".into());
++    ui.horizontal(|ui| {
++        dim_label(ui, tl!("View:"));
++        crate::panels::image_trace::view_dropdown(app, ui, &view, ui.available_width());
++    });
+     let w = (ui.available_width() - 6.0) / 2.0;
+     ui.horizontal(|ui| {
+         for (label, id) in [(tl!("Expand"), "imageTrace.expand"), (tl!("Release"), "imageTrace.release")] {

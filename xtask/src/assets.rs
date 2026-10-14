@@ -39,14 +39,22 @@ const ASSET_EXT: &[&str] = &[
 ];
 const ASSET_DIRS: &[&str] = &["assets/", "docs/images/", "examples/"];
 
-pub fn is_asset(path: &str) -> bool {
-    let ext = Path::new(path).extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).unwrap_or_default();
-    ASSET_DIRS.iter().any(|d| path.starts_with(d)) || ASSET_EXT.contains(&ext.as_str())
+pub fn is_asset(rel: &str) -> bool {
+    let norm = rel.replace('\\', "/");
+    let ext = Path::new(&norm).extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).unwrap_or_default();
+    ASSET_DIRS.iter().any(|d| norm.starts_with(d)) || ASSET_EXT.contains(&ext.as_str())
 }
 
 /// Paths that need an ASSETS.md entry but lack one.
 pub fn missing(files: &[String], assets_md: &str) -> Vec<String> {
-    files.iter().filter(|f| is_asset(f) && !assets_md.contains(&format!("`{f}`"))).cloned().collect()
+    files
+        .iter()
+        .filter(|f| {
+            let norm = f.replace('\\', "/");
+            is_asset(&norm) && !assets_md.contains(&format!("`{norm}`"))
+        })
+        .cloned()
+        .collect()
 }
 
 pub fn run(root: &Path) -> Result<(), String> {
@@ -72,5 +80,14 @@ mod tests {
         assert_eq!(missing(&files, md), vec!["docs/images/b.png".to_string(), "tests/fixture.png".into()]);
         assert!(!is_asset("crates/x/src/lib.rs"));
         assert!(is_asset("assets/fonts/OFL.txt"));
+    }
+
+    #[test]
+    fn normalizes_windows_paths() {
+        let files = vec![r"assets\icons\a.svg".to_string(), r"docs\images\b.png".into()];
+        let md = "| `assets/icons/a.svg` | me | here | MIT |";
+        assert_eq!(missing(&files, md), vec![r"docs\images\b.png".to_string()]);
+        assert!(is_asset(r"assets\fonts\OFL.txt"));
+        assert!(!is_asset(r"crates\x\src\lib.rs"));
     }
 }

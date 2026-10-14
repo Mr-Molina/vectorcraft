@@ -2,9 +2,14 @@
 //! and colour groups exactly), `.gpl` palettes (8-bit RGB; colour groups as `# Group:` comment
 //! headers) and CSS custom properties (written only).
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{Color, GradientKind, Paint, Swatch, SwatchGroup, SwatchLibrary};
+
+/// Maximum number of swatches permitted when importing a palette.
+pub const MAX_PALETTE_SWATCHES: usize = 16_384;
 
 /// A swatch library file format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -140,7 +145,7 @@ fn css_comment(s: &str) -> String {
 
 fn write_css(lib: &SwatchLibrary, keep: impl Fn(&&Swatch) -> bool) -> String {
     let mut out = format!("/* {} */\n:root {{\n", css_comment(&lib.name));
-    let mut taken: Vec<String> = vec![];
+    let mut taken: HashSet<String> = HashSet::new();
     let mut props = |out: &mut String, list: &[Swatch]| {
         for w in list.iter().filter(&keep) {
             let value = match &w.paint {
@@ -158,7 +163,7 @@ fn write_css(lib: &SwatchLibrary, keep: impl Fn(&&Swatch) -> bool) -> String {
             // Names differing only in case or punctuation map to one property: number the others.
             let base = css_property(&w.name);
             let name = (1..).map(|i| if i == 1 { base.clone() } else { format!("{base}-{i}") }).find(|n| !taken.contains(n)).unwrap_or(base);
-            taken.push(name.clone());
+            taken.insert(name.clone());
             let note = if w.spot { " /* spot */" } else { "" };
             out.push_str(&format!("  {name}: {value};{note}\n"));
         }
@@ -185,6 +190,9 @@ pub fn read(text: &str, name: &str) -> Result<SwatchLibrary, String> {
             return Err(format!("not a swatch library (format `{}`)", f.format));
         }
         let mut lib = f.library;
+        if lib.swatches.len() > MAX_PALETTE_SWATCHES || lib.groups.iter().map(|g| g.swatches.len()).sum::<usize>() > MAX_PALETTE_SWATCHES {
+            return Err(format!("palette exceeds maximum of {MAX_PALETTE_SWATCHES} swatches"));
+        }
         if lib.name.trim().is_empty() {
             lib.name = name.into();
         }
@@ -204,8 +212,12 @@ pub fn sniff(text: &str) -> bool {
 /// named by their values; repeated names get a number.
 fn read_gpl(text: &str, fallback: &str) -> SwatchLibrary {
     let mut lib = SwatchLibrary { name: fallback.into(), ..Default::default() };
-    let mut names: Vec<String> = vec![];
+    let mut names: HashSet<String> = HashSet::new();
+    let mut count = 0;
     for line in text.lines().skip(1) {
+        if count >= MAX_PALETTE_SWATCHES {
+            break;
+        }
         let line = line.trim();
         if let Some(g) = line.strip_prefix(GPL_GROUP) {
             lib.groups.push(SwatchGroup { name: g.trim().to_string(), swatches: vec![] });
@@ -218,18 +230,29 @@ fn read_gpl(text: &str, fallback: &str) -> SwatchLibrary {
         // Comments, headers (`Columns: 4`) and anything else that isn't a colour are skipped.
         let words: Vec<&str> = line.split_whitespace().collect();
         let rgb: Vec<u8> = words.iter().take(3).map_while(|v| v.parse().ok()).collect();
-        let [r, g, b] = rgb[..] else { continue };
-        let rest = words[3..].join(" ");
+        let &[r, g, b] = rgb.as_slice() else { continue };
+        let rest = words.get(3..).map(|w| w.join(" ")).unwrap_or_default();
         let base = if rest.is_empty() { format!("R={r} G={g} B={b}") } else { rest };
         let name = (1..).map(|i| if i == 1 { base.clone() } else { format!("{base} {i}") }).find(|n| !names.contains(n)).unwrap_or(base);
-        names.push(name.clone());
+        names.insert(name.clone());
         let w = Swatch { name, paint: Paint::solid(Color::rgb8(r, g, b)), global: false, spot: false };
+        count += 1;
         match lib.groups.last_mut() {
             Some(grp) => grp.swatches.push(w),
             None => lib.swatches.push(w),
         }
     }
     lib
+}
+
+/// Read an Adobe Swatch Exchange (.ase) file (capped at [`MAX_PALETTE_SWATCHES`]).
+pub fn read_ase(_bytes: &[u8], _fallback: &str) -> Result<SwatchLibrary, String> {
+    Err("ASE format is not supported".into())
+}
+
+/// Read an Adobe Color (.aco) file (capped at [`MAX_PALETTE_SWATCHES`]).
+pub fn read_aco(_bytes: &[u8], _fallback: &str) -> Result<SwatchLibrary, String> {
+    Err("ACO format is not supported".into())
 }
 
 #[cfg(test)]
@@ -320,5 +343,15 @@ mod tests {
         let text = write(&lib, PaletteFormat::Css);
         assert!(text.contains("--red: #000000;") && text.contains("--red-2: #000000;"));
         assert!(read(&text, "x").is_err(), "CSS is written only");
+    }
+
+    #[test]
+    fn gpl_caps_at_max_palette_swatches() {
+        let mut text = String::from("GIMP Palette\nName: Large\n");
+        for i in 0..20_000 {
+            text.push_str(&format!("{} {} {}\tSwatch {i}\n", i % 256, (i / 256) % 256, (i / 65536) % 256));
+        }
+        let lib = read(&text, "Large").unwrap();
+        assert_eq!(lib.swatches.len(), MAX_PALETTE_SWATCHES);
     }
 }

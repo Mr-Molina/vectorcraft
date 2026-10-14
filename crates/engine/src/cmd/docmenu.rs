@@ -220,11 +220,11 @@ pub fn specs() -> Vec<CommandSpec> {
             super::fileinfo::file_info
         ),
         cmd!(
-            "render.overlay",
+            query "render.overlay",
             "Render Labeled Overlay",
             [],
             None,
-            "{path: string, scale?: float, node_ids?: [int], ungrouped_only?: bool} → {path, annotated_count, dimensions: {width, height}}",
+            "{artboard?: int (default 0), scale?: float (default 1), ids?: [int], ungroupedOnly?: bool, path?: string} → {pngBase64: string, width: int, height: int, annotatedCount: int, path: string|null} the artboard rendered with each object's world bounds boxed and labelled by id (ids absent: the top-level objects of every visible layer and sublayer; ungroupedOnly: only loose objects — directly in a layer and not groups); written to path only when given",
             has_doc,
             render_overlay
         ),
@@ -670,59 +670,125 @@ fn blend_pixel(img: &mut image::RgbaImage, x: i32, y: i32, color: [u8; 4]) {
     px.0 = [r.min(255) as u8, g.min(255) as u8, b.min(255) as u8, a.min(255) as u8];
 }
 
-pub(crate) fn render_overlay(s: &mut Session, p: &Value) -> Result<Value> {
-    let path = p.get("path").and_then(Value::as_str).ok_or_else(|| bad("render.overlay", "missing target path"))?;
-    let scale = match p.get("scale") {
-        Some(v) => {
-            let sc = v.as_f64().ok_or_else(|| bad("render.overlay", "scale must be a positive finite number"))?;
-            if !sc.is_finite() || sc <= 0.0 {
-                return Err(bad("render.overlay", "scale must be a positive finite number"));
-            }
-            sc
+/// Most ids `render.overlay` accepts in one call (untrusted input).
+const OVERLAY_MAX_IDS: usize = 100_000;
+/// Most bounding box targets `render.overlay` will annotate to prevent slow pixel tint loops.
+const OVERLAY_MAX_TARGETS: usize = 2048;
+
+/// `p[key]`, treating JSON `null` as absent.
+fn overlay_param<'a>(p: &'a Value, key: &str) -> Option<&'a Value> {
+    p.get(key).filter(|v| !v.is_null())
+}
+
+/// The top-level objects (children of layers and sublayers, not of groups) of `layer`, skipping
+/// hidden objects and hidden sublayers.
+fn overlay_layer_art(layer: &Node, depth: usize, out: &mut Vec<NodeId>) {
+    if depth >= 512 {
+        return;
+    }
+    for c in layer.children().into_iter().flatten().filter(|c| c.visible) {
+        if c.is_layer() {
+            overlay_layer_art(c, depth + 1, out);
+        } else {
+            out.push(c.id);
         }
-        None => 2.0,
+    }
+}
+
+pub(crate) fn render_overlay(s: &mut Session, p: &Value) -> Result<Value> {
+    const C: &str = "render.overlay";
+    let path = match overlay_param(p, "path") {
+        Some(v) => {
+            let s = v.as_str().filter(|s| !s.is_empty()).ok_or_else(|| bad(C, "path must be a non-empty string"))?;
+            if s.contains('\0') || std::path::Path::new(s).components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+                return Err(bad(C, "path cannot contain parent directory components or null bytes"));
+            }
+            Some(s)
+        }
+        None => None,
+    };
+    let scale = match overlay_param(p, "scale") {
+        Some(v) => v.as_f64().filter(|sc| sc.is_finite() && *sc > 0.0).ok_or_else(|| bad(C, "scale must be a positive finite number"))?,
+        None => 1.0,
+    };
+    let artboard_index = match overlay_param(p, "artboard") {
+        Some(v) => v.as_u64().ok_or_else(|| bad(C, "artboard must be a non-negative integer"))?,
+        None => 0,
+    };
+    let ungrouped_only = match overlay_param(p, "ungroupedOnly") {
+        Some(v) => v.as_bool().ok_or_else(|| bad(C, "ungroupedOnly must be true or false"))?,
+        None => false,
+    };
+    let ids: Option<Vec<NodeId>> = match overlay_param(p, "ids") {
+        Some(v) => {
+            let arr = v.as_array().ok_or_else(|| bad(C, "ids must be an array of non-negative integers"))?;
+            if arr.len() > OVERLAY_MAX_IDS {
+                return Err(bad(C, format!("ids may list at most {OVERLAY_MAX_IDS} objects")));
+            }
+            let mut seen = std::collections::HashSet::with_capacity(arr.len());
+            let mut out = Vec::with_capacity(arr.len());
+            for v in arr {
+                let id = NodeId(v.as_u64().ok_or_else(|| bad(C, "ids must be an array of non-negative integers"))?);
+                if seen.insert(id) {
+                    out.push(id);
+                }
+            }
+            Some(out)
+        }
+        None => None,
     };
 
     let doc = &s.doc()?.doc;
-    let artboard = doc.artboards.first().ok_or_else(|| bad("render.overlay", "document has no artboard"))?;
+    let artboard = usize::try_from(artboard_index)
+        .ok()
+        .and_then(|i| doc.artboards.get(i))
+        .ok_or_else(|| bad(C, format!("artboard {artboard_index} is out of range (the document has {})", doc.artboards.len())))?;
+    let region = artboard.rect;
+    if ![region.x0, region.y0, region.x1, region.y1].iter().all(|v| v.is_finite()) {
+        return Err(bad(C, "artboard has non-finite bounds"));
+    }
+    // Refuse before rendering anything (same limit as File › Export and Rasterize).
+    super::menucmds::check_raster_size(region, scale)?;
 
-    let mut targets: Vec<(NodeId, vectorcraft_geom::Rect)> = Vec::new();
-    if let Some(arr) = p.get("node_ids").and_then(Value::as_array) {
-        let mut seen = std::collections::HashSet::new();
-        for v in arr {
-            if let Some(id_num) = v.as_u64() {
-                let id = NodeId(id_num);
-                if seen.insert(id)
-                    && let Some(n) = doc.node(id)
-                    && let Some(bounds) = n.geometric_bounds()
-                {
-                    targets.push((n.id, bounds));
-                }
+    // Explicit ids are looked up anywhere in the tree (unknown ids are skipped); otherwise the
+    // top-level objects of every visible layer.
+    let candidates: Vec<NodeId> = match ids {
+        Some(ids) => ids.into_iter().filter(|id| doc.node(*id).is_some()).collect(),
+        None => {
+            let mut out = Vec::new();
+            for layer in doc.layers.iter().filter(|l| l.visible) {
+                overlay_layer_art(layer, 0, &mut out);
             }
+            out
         }
-    } else {
-        let ungrouped_only = bool_or(p, "ungrouped_only", false);
-        for layer in &doc.layers {
-            if let Some(children) = layer.children() {
-                for child in children {
-                    if ungrouped_only && matches!(child.kind, NodeKind::Group { .. }) {
-                        continue;
-                    }
-                    if let Some(bounds) = child.geometric_bounds() {
-                        targets.push((child.id, bounds));
-                    }
-                }
-            }
+    };
+    let mut targets: Vec<(NodeId, vectorcraft_geom::Rect)> = Vec::with_capacity(candidates.len().min(OVERLAY_MAX_TARGETS));
+    for id in candidates {
+        if targets.len() >= OVERLAY_MAX_TARGETS {
+            break;
+        }
+        // ungroupedOnly: loose objects only — directly in a layer and not themselves groups.
+        let loose = || {
+            doc.parent_of(id).and_then(|pid| doc.node(pid)).is_some_and(Node::is_layer)
+                && doc.node(id).is_some_and(|n| !matches!(n.kind, NodeKind::Group { .. }))
+        };
+        if ungrouped_only && !loose() {
+            continue;
+        }
+        // World-space geometric bounds, as reported by document.inspect's selectionBounds.
+        if let Some(b) = doc.bounds_of(&[id], false) {
+            targets.push((id, b));
         }
     }
 
     let mut renderer = vectorcraft_render::Renderer::new();
-    let rendered = renderer.render_region(doc, artboard.rect, scale, true);
-    let mut img = image::RgbaImage::from_raw(rendered.width, rendered.height, rendered.to_straight())
-        .ok_or_else(|| bad("render.overlay", "invalid rendered image buffer"))?;
+    let rendered = renderer.render_region(doc, region, scale, true);
+    let mut img =
+        image::RgbaImage::from_raw(rendered.width, rendered.height, rendered.to_straight()).ok_or_else(|| bad(C, "invalid rendered image buffer"))?;
 
-    let w = img.width() as i32;
-    let h = img.height() as i32;
+    // At most 65535 per side (checked above), so these always fit.
+    let w = i32::try_from(img.width()).unwrap_or(i32::MAX);
+    let h = i32::try_from(img.height()).unwrap_or(i32::MAX);
 
     const TINT: [u8; 4] = [0, 150, 255, 40];
     const BORDER: [u8; 4] = [0, 120, 240, 220];
@@ -733,35 +799,32 @@ pub(crate) fn render_overlay(s: &mut Session, p: &Value) -> Result<Value> {
     let mut annotated = 0usize;
 
     for (node_id, bounds) in targets {
-        if !bounds.x0.is_finite() || !bounds.y0.is_finite() || !bounds.x1.is_finite() || !bounds.y1.is_finite() {
+        // Pixel coordinates, clamped to just outside the image so far-away art can't make the
+        // drawing loops below run for billions of iterations.
+        let to_px = |v: f64, origin: f64, max: i32| -> Option<i32> {
+            let r = ((v - origin) * scale).round();
+            r.is_finite().then(|| r.clamp(-1.0, f64::from(max) + 1.0) as i32)
+        };
+        let (Some(x0), Some(y0), Some(x1), Some(y1)) =
+            (to_px(bounds.x0, region.x0, w), to_px(bounds.y0, region.y0, h), to_px(bounds.x1, region.x0, w), to_px(bounds.y1, region.y0, h))
+        else {
             continue;
-        }
-        if !artboard.rect.x0.is_finite() || !artboard.rect.y0.is_finite() {
-            continue;
-        }
-
-        let rx0 = ((bounds.x0 - artboard.rect.x0) * scale).round();
-        let ry0 = ((bounds.y0 - artboard.rect.y0) * scale).round();
-        let rx1 = ((bounds.x1 - artboard.rect.x0) * scale).round();
-        let ry1 = ((bounds.y1 - artboard.rect.y0) * scale).round();
-
-        if !rx0.is_finite() || !ry0.is_finite() || !rx1.is_finite() || !ry1.is_finite() {
-            continue;
-        }
-
-        let x0 = rx0 as i32;
-        let y0 = ry0 as i32;
-        let x1 = rx1 as i32;
-        let y1 = ry1 as i32;
+        };
 
         let (bx0, bx1) = if x0 <= x1 { (x0, x1) } else { (x1, x0) };
         let (by0, by1) = if y0 <= y1 { (y0, y1) } else { (y1, y0) };
 
-        // 1. Semi-transparent bounding box interior tint
-        let fill_x0 = bx0.clamp(0, w);
-        let fill_x1 = bx1.clamp(0, w);
-        let fill_y0 = by0.clamp(0, h);
-        let fill_y1 = by1.clamp(0, h);
+        // A box entirely outside the image gets no badge and doesn't count as annotated.
+        if bx1 < 0 || by1 < 0 || bx0 > w - 1 || by0 > h - 1 {
+            continue;
+        }
+
+        // 1. Semi-transparent bounding box interior tint (`.max(0)`: `clamp` panics if min > max).
+        let (last_x, last_y) = ((w - 1).max(0), (h - 1).max(0));
+        let fill_x0 = bx0.clamp(0, last_x);
+        let fill_x1 = bx1.clamp(0, last_x);
+        let fill_y0 = by0.clamp(0, last_y);
+        let fill_y1 = by1.clamp(0, last_y);
 
         for y in fill_y0..=fill_y1 {
             for x in fill_x0..=fill_x1 {
@@ -835,19 +898,18 @@ pub(crate) fn render_overlay(s: &mut Session, p: &Value) -> Result<Value> {
         annotated += 1;
     }
 
-    if let Some(parent) = std::path::Path::new(path).parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent).map_err(|e| bad("render.overlay", format!("failed to create directory: {e}")))?;
+    // Same encoder as `Rendered::to_png` (PNG, no metadata), in memory.
+    let mut png = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).map_err(|e| bad(C, format!("failed to encode PNG: {e}")))?;
+    if let Some(path) = path {
+        super::fileio::write_file(path, &png)?;
     }
-    img.save(path).map_err(|e| bad("render.overlay", format!("failed to save image: {e}")))?;
 
     Ok(json!({
+        "pngBase64": vectorcraft_format::base64_encode(&png),
+        "width": img.width(),
+        "height": img.height(),
+        "annotatedCount": annotated,
         "path": path,
-        "annotated_count": annotated,
-        "dimensions": {
-            "width": img.width(),
-            "height": img.height()
-        }
     }))
 }

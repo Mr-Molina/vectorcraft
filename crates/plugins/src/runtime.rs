@@ -14,6 +14,9 @@ pub const ABI_VERSION: i32 = 1;
 /// Fuel handed out per slice; between slices the host checks the deadline.
 const FUEL_SLICE: u64 = 20_000_000;
 
+/// Upper limit on fuel allocated for a plugin execution (SEC-501).
+pub const MAX_PLUGIN_FUEL: u64 = 500_000_000;
+
 /// Resource limits for running plug-ins.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Limits {
@@ -151,6 +154,9 @@ impl Plugin {
         }
         let manifest: TypedFunc<(), i64> = live.func("vc_manifest")?;
         let packed = p.call(&mut live, &manifest, (), p.limits.fuel_base, &deadline)?;
+        if packed < 0 {
+            return Err(Error::Failed(format!("plugin returned error code {packed}")));
+        }
         let text = live.read_packed(packed, "vc_manifest", MAX_MANIFEST_BYTES).map_err(|e| match e {
             Error::Limit(_) => Error::Manifest(format!("manifest is too long (limit {MAX_MANIFEST_BYTES} bytes)")),
             e => e,
@@ -265,7 +271,7 @@ impl Plugin {
         };
         let iptr = place(&mut live, input)?;
         let pptr = place(&mut live, params)?;
-        let fuel = limits.fuel_base.saturating_add((input.len() as u64).saturating_mul(limits.fuel_per_byte));
+        let fuel = limits.fuel_base.saturating_add((input.len() as u64).saturating_mul(limits.fuel_per_byte)).min(MAX_PLUGIN_FUEL);
         let packed = self.call(&mut live, &run, (iptr as i32, input.len() as i32, pptr as i32, params.len() as i32), fuel, &deadline)?;
         if packed < 0 {
             return Err(Error::Failed(format!("vc_run returned error code {packed}")));

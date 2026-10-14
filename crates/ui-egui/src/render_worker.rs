@@ -50,11 +50,15 @@ impl Worker {
                         job = newer;
                     }
                     let t0 = crate::now_ms();
-                    let img = r.render(&job.doc, job.w, job.h, job.view, &job.opts);
-                    if done_tx.send(Done { key: job.key, img, ms: crate::now_ms() - t0 }).is_err() {
-                        break;
+                    let rendered = vectorcraft_engine::guard::catch_panic(std::panic::AssertUnwindSafe(|| {
+                        r.render(&job.doc, job.w, job.h, job.view, &job.opts)
+                    }));
+                    if let Ok(img) = rendered {
+                        if done_tx.send(Done { key: job.key, img, ms: crate::now_ms() - t0 }).is_err() {
+                            break;
+                        }
+                        ctx.request_repaint();
                     }
-                    ctx.request_repaint();
                 }
             })
             .ok()?;

@@ -276,6 +276,8 @@ fn hash6(password: &[u8], salt: &[u8], udata: &[u8]) -> Result<[u8; 32], PdfErro
     }
 }
 
+static ENTROPY_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// Unpredictable bytes: SHA-256 of a seed and a counter.
 struct Entropy {
     seed: [u8; 32],
@@ -292,6 +294,29 @@ impl Entropy {
             h.update(state.hash_one(i).to_le_bytes());
         }
         h.update(vectorcraft_doc::metadata::now_unix().unwrap_or_default().to_le_bytes());
+
+        let counter_val = ENTROPY_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        #[cfg(not(target_arch = "wasm32"))]
+        let pid = u64::from(std::process::id());
+        #[cfg(target_arch = "wasm32")]
+        let pid = 0u64;
+
+        #[cfg(not(target_arch = "wasm32"))]
+        let nanos = std::time::Instant::now().elapsed().as_nanos() as u64;
+        #[cfg(target_arch = "wasm32")]
+        let nanos = 0u64;
+
+        let mut s: u64 = pid ^ nanos ^ counter_val;
+        let stack_addr = (&s as *const u64 as usize) as u64;
+        s ^= stack_addr;
+        s = (s ^ (s >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        s = (s ^ (s >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        s ^= s >> 31;
+
+        h.update(s.to_le_bytes());
+        h.update(counter_val.to_le_bytes());
+
         for m in material {
             h.update((m.len() as u64).to_le_bytes());
             h.update(m);
@@ -803,13 +828,16 @@ fn xref_table(pdf: &[u8], xref: usize) -> Result<(Vec<Entry>, Obj<'_>), PdfError
         }
         let (first, count) = (word(lx.next()), word(lx.next()));
         let (Some(first), Some(count)) = (first, count) else { return Err(failed("bad cross-reference table")) };
+        if !(0..=1_000_000).contains(&count) {
+            return Err(failed("bad cross-reference table"));
+        }
         for i in 0..count {
             let (off, generation, kind) = (word(lx.next()), word(lx.next()), lx.next());
             let (Some(off), Some(generation), Some((Tok::Word(kind), ..))) = (off, generation, kind) else {
                 return Err(failed("bad cross-reference entry"));
             };
             if kind == b"n" {
-                let num = u32::try_from(first + i).map_err(|_| failed("bad object number"))?;
+                let num = first.checked_add(i).and_then(|n| u32::try_from(n).ok()).ok_or_else(|| failed("bad object number"))?;
                 entries.push((num, u16::try_from(generation).unwrap_or(0), usize::try_from(off).map_err(|_| failed("bad offset"))?));
             }
         }
@@ -1005,6 +1033,21 @@ fn trailer(pdf: &[u8]) -> Option<Obj<'_>> {
 
 /// The object `num generation` of `pdf`, found by its header (the last one in the file).
 fn find_object(pdf: &[u8], num: u32, generation: u16) -> Option<Obj<'_>> {
+    let lookup_via_xref = || -> Option<Obj<'_>> {
+        let xref = xref_offset(pdf)?;
+        let (entries, _) = xref_table(pdf, xref).ok()?;
+        let head_prefix = format!("{num} ");
+        let &(_, _, off) = entries.iter().find(|(n, g, _)| *n == num && *g == generation).or_else(|| entries.iter().find(|(n, _, _)| *n == num))?;
+        if !pdf.get(off..)?.starts_with(head_prefix.as_bytes()) {
+            return None;
+        }
+        let mut lx = Lexer::at(pdf, off);
+        lx.header()?;
+        lx.object(0)
+    };
+    if let Some(obj) = lookup_via_xref() {
+        return Some(obj);
+    }
     let head = format!("{num} {generation} obj");
     let mut end = pdf.len();
     while let Some(at) = rfind(pdf.get(..end)?, head.as_bytes()) {
@@ -1032,6 +1075,11 @@ pub(crate) fn user_password(pdf: &[u8], owner: &str) -> Option<String> {
         d @ Obj::Dict { .. } => d,
         _ => return None,
     };
+    let v = enc.int(b"V").unwrap_or(0);
+    let u = enc.string(b"U")?;
+    if (v == 5 && u.len() < 48) || v == 5 || u.len() < 32 {
+        return None;
+    }
     let r = u8::try_from(enc.int(b"R")?).ok().filter(|r| (2..=4).contains(r))?;
     let n = if r == 2 { 5 } else { usize::try_from(enc.int(b"Length").unwrap_or(40) / 8).ok()?.clamp(5, 16) };
     let key = owner_key(owner.as_bytes(), r, n);
@@ -1044,6 +1092,6 @@ pub(crate) fn user_password(pdf: &[u8], owner: &str) -> Option<String> {
         }
     }
     // The password is what comes before the padding.
-    let len = (0..=32).find(|l| user.get(*l..) == PAD.get(..32 - l))?;
+    let len = (0..32).find(|l| user.get(*l..) == PAD.get(..32 - l))?;
     String::from_utf8(user.get(..len)?.to_vec()).ok()
 }

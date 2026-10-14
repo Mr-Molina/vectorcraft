@@ -53,9 +53,12 @@ pub(crate) fn png(img: &Raster) -> Result<Vec<u8>, String> {
 }
 
 /// Most pixels a palette preview may have.
+#[cfg(target_arch = "wasm32")]
+const MAX_PIXELS: usize = 16_777_216;
+#[cfg(not(target_arch = "wasm32"))]
 const MAX_PIXELS: usize = 1 << 26;
 /// Most values a TIFF field may have.
-const MAX_VALUES: usize = 1 << 20;
+const MAX_VALUES: usize = 65_536;
 
 /// A TIFF's bytes in its byte order.
 struct Tiff<'a> {
@@ -74,26 +77,28 @@ impl Tiff<'_> {
         Some(if self.big { u32::from_be_bytes(b) } else { u32::from_le_bytes(b) })
     }
 
-    /// The values of the directory entry at `at` (bytes, shorts or longs; in the entry when they
-    /// fit in four bytes).
+    /// The values of the directory entry at `at` (shorts or longs; in the entry when they fit in
+    /// four bytes).
     fn values(&self, at: usize) -> Option<Vec<u32>> {
         let (kind, n) = (self.u16(at.checked_add(2)?)?, self.u32(at.checked_add(4)?)? as usize);
-        let size = match kind {
-            1 => 1,
-            3 => 2,
-            4 => 4,
-            _ => return None,
-        };
         if n > MAX_VALUES {
             return None;
         }
+        let elem_size = match kind {
+            3 => 2usize,
+            4 => 4usize,
+            _ => return None,
+        };
         let field = at.checked_add(8)?;
-        let start = if n * size <= 4 { field } else { self.u32(field)? as usize };
+        let byte_len = n.checked_mul(elem_size)?;
+        let start = if byte_len <= 4 { field } else { self.u32(field)? as usize };
+        if start.checked_add(byte_len)? > self.b.len() {
+            return None;
+        }
         (0..n)
             .map(|i| {
-                let at = start.checked_add(i * size)?;
-                match size {
-                    1 => self.b.get(at).map(|v| u32::from(*v)),
+                let at = start.checked_add(i * elem_size)?;
+                match elem_size {
                     2 => self.u16(at).map(u32::from),
                     _ => self.u32(at),
                 }

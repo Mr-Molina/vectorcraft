@@ -154,27 +154,35 @@ impl Headless {
         Ok(())
     }
 
+    fn pointer_one(&mut self, e: &Value, base: Mods, requests: &mut Vec<Value>) -> Result<(), String> {
+        let kind = s(e, "kind").unwrap_or("");
+        let kind = pointer_kind(kind).ok_or_else(|| format!("unknown pointer kind `{kind}` (down|drag|up|move|doubleclick)"))?;
+        if s(e, "space") == Some("screen") {
+            return Err("screen-space pointer events need the desktop app; use document coordinates".into());
+        }
+        let x = e.get("x").and_then(Value::as_f64).ok_or("pointer event needs numeric `x`")?;
+        let y = e.get("y").and_then(Value::as_f64).ok_or("pointer event needs numeric `y`")?;
+        let mods = e.get("mods").and_then(|m| serde_json::from_value(m.clone()).ok()).unwrap_or(base);
+        let ev = PointerEvent { kind, pos: Point::new(x, y), mods, pressure: PointerEvent::json_pressure(e) };
+        let reqs = self.session.pointer(&ev, self.view).map_err(|e| e.to_string())?;
+        self.apply_ui_requests(reqs, requests)?;
+        let hold = PointerEvent::json_hold(e);
+        if hold > 0.0 {
+            let reqs = self.session.tool_tick(hold, self.view).map_err(|e| e.to_string())?;
+            self.apply_ui_requests(reqs, requests)?;
+        }
+        Ok(())
+    }
+
     fn pointer(&mut self, p: &Value) -> Result<Value, String> {
         let events = p.get("events").and_then(Value::as_array).ok_or("missing `events`")?;
         let base: Mods = p.get("mods").and_then(|m| serde_json::from_value(m.clone()).ok()).unwrap_or_default();
         self.ensure_document();
         let mut requests = vec![];
         for e in events {
-            let kind = s(e, "kind").unwrap_or("");
-            let kind = pointer_kind(kind).ok_or_else(|| format!("unknown pointer kind `{kind}` (down|drag|up|move|doubleclick)"))?;
-            if s(e, "space") == Some("screen") {
-                return Err("screen-space pointer events need the desktop app; use document coordinates".into());
-            }
-            let x = e.get("x").and_then(Value::as_f64).ok_or("pointer event needs numeric `x`")?;
-            let y = e.get("y").and_then(Value::as_f64).ok_or("pointer event needs numeric `y`")?;
-            let mods = e.get("mods").and_then(|m| serde_json::from_value(m.clone()).ok()).unwrap_or(base);
-            let ev = PointerEvent { kind, pos: Point::new(x, y), mods, pressure: PointerEvent::json_pressure(e) };
-            let reqs = self.session.pointer(&ev, self.view).map_err(|e| e.to_string())?;
-            self.apply_ui_requests(reqs, &mut requests)?;
-            let hold = PointerEvent::json_hold(e);
-            if hold > 0.0 {
-                let reqs = self.session.tool_tick(hold, self.view).map_err(|e| e.to_string())?;
-                self.apply_ui_requests(reqs, &mut requests)?;
+            if let Err(err) = self.pointer_one(e, base, &mut requests) {
+                let _ = self.session.cancel_interaction();
+                return Err(err);
             }
         }
         let sel = self.session.active().map(|d| d.selection.objects.iter().map(|i| i.0).collect::<Vec<_>>()).unwrap_or_default();
@@ -221,7 +229,10 @@ impl Headless {
     fn render(&mut self, p: &Value) -> Result<Value, String> {
         let st = self.session.active().ok_or("no document")?;
         let doc = st.doc.clone();
-        let idx = p.get("artboard").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let idx = match p.get("artboard") {
+            Some(v) if !v.is_null() => v.as_u64().and_then(|v| usize::try_from(v).ok()).ok_or_else(|| "invalid artboard index".to_string())?,
+            _ => 0,
+        };
         let r = doc.artboards.get(idx).map(|a| a.rect).ok_or("no such artboard")?;
         let scale = p.get("scale").and_then(Value::as_f64).unwrap_or(1.0).clamp(0.01, 16.0);
         vectorcraft_render::raster_size(r, scale)?;

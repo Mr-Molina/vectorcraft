@@ -52,6 +52,35 @@ fn method(obj: &JsValue, name: &str) -> Option<Function> {
     Reflect::get(obj, &name.into()).ok()?.dyn_into().ok()
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct LockEntry {
+    pub tab: String,
+    pub area: String,
+    pub expires: f64,
+}
+
+fn current_tab_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    thread_local! {
+        static TAB: String = format!("tab-{}", NEXT.fetch_add(1, Ordering::Relaxed));
+    }
+    TAB.with(|t| t.clone())
+}
+
+fn parse_lock_entries(val: &JsValue) -> Vec<LockEntry> {
+    let mut out = vec![];
+    let Ok(arr) = val.clone().dyn_into::<js_sys::Array>() else { return out };
+    for i in 0..arr.length() {
+        let item = arr.get(i);
+        let tab = Reflect::get(&item, &"tab".into()).ok().and_then(|v| v.as_string()).unwrap_or_default();
+        let area = Reflect::get(&item, &"area".into()).ok().and_then(|v| v.as_string()).unwrap_or_default();
+        let expires = Reflect::get(&item, &"expires".into()).ok().and_then(|v| v.as_f64()).unwrap_or(0.0);
+        out.push(LockEntry { tab, area, expires });
+    }
+    out
+}
+
 impl WebLocks {
     /// The page's Web Locks with a first snapshot of them, kept fresh from then on; `None` when
     /// the browser has none or won't say which are held (heartbeats alone decide then).
@@ -87,11 +116,28 @@ impl WebLocks {
         *self.seen.lock().unwrap_or_else(|e| e.into_inner()) = (asked, areas);
         Some(())
     }
-
     /// Does a tab hold `area`'s lock? Yes when the last snapshot is too old to tell.
     pub fn held(&self, area: &str) -> bool {
         let seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
-        js_sys::Date::now() - seen.0 > FRESH_MS || seen.1.contains(area)
+        if js_sys::Date::now() - seen.0 <= FRESH_MS {
+            return seen.1.contains(area);
+        }
+        // LocalStorage fallback when Web Locks are not available or snapshot is stale:
+        // filter out expired entries before checking .any(|e| e.tab != me)
+        if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+            let key = format!("{}locks", self.prefix);
+            let area_key = format!("{}{area}", self.prefix);
+            let raw = storage.get_item(&key).ok().flatten().or_else(|| storage.get_item(&area_key).ok().flatten());
+            if let Some(raw) = raw {
+                if let Ok(parsed) = js_sys::JSON::parse(&raw) {
+                    let now = js_sys::Date::now();
+                    let me = current_tab_id();
+                    let entries = parse_lock_entries(&parsed);
+                    return entries.iter().filter(|e| e.expires > now && (e.area.is_empty() || e.area == area)).any(|e| e.tab != me);
+                }
+            }
+        }
+        seen.1.contains(area)
     }
 
     /// Hold `area`'s lock until the returned hold is dropped (or the page goes).
@@ -104,7 +150,12 @@ impl WebLocks {
         let release = release?;
         let granted = Closure::once_into_js(move |_lock: JsValue| until);
         method(&m, "request")?.call2(&m, &name.clone().into(), &granted).ok()?;
-        RELEASE.with(|r| r.borrow_mut().insert(name.clone(), release));
+        RELEASE.with(|r| {
+            if let Some(prev) = r.borrow_mut().remove(&name) {
+                let _ = prev.call0(&JsValue::NULL);
+            }
+            r.borrow_mut().insert(name.clone(), release);
+        });
         Some(Box::new(LockHold(name)))
     }
 }

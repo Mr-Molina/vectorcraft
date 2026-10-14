@@ -188,14 +188,41 @@ pub fn load_with(name: &str, bytes: &[u8], opts: &LoadOptions) -> Result<Loaded>
     Ok(Loaded { doc, format, warnings, restored, converted })
 }
 
+const MAX_SVG_LINK_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Import SVG text, reading the files its images link to (relative links from `folder`, the SVG's
 /// own): rasters stay linked, SVG files become art, missing ones placeholders (see
 /// [`vectorcraft_svg::ImportOptions`]).
 pub(crate) fn import_svg(text: &str, folder: Option<&str>) -> Result<(Document, Vec<String>)> {
     let read = |path: &str| {
+        if path.contains('\0') {
+            return None;
+        }
+        if let Some(f) = folder {
+            let rel = std::path::Path::new(path).strip_prefix(f).ok()?;
+            if rel.to_string_lossy().contains('\0')
+                || rel
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::RootDir | std::path::Component::Prefix(_)))
+            {
+                return None;
+            }
+        } else {
+            let p = std::path::Path::new(path);
+            if p.components().any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::RootDir | std::path::Component::Prefix(_)))
+            {
+                return None;
+            }
+        }
         // Only files (not folders or devices) are read.
-        file_stamp(path)?;
+        let (size, _) = file_stamp(path)?;
+        if size > MAX_SVG_LINK_BYTES {
+            return None;
+        }
         let bytes = read_file(path).ok()?;
+        if bytes.len() as u64 > MAX_SVG_LINK_BYTES {
+            return None;
+        }
         let link = crate::cmd::links::link_info(path, &bytes);
         Some((bytes, link))
     };
@@ -288,10 +315,21 @@ pub fn raster_image(bytes: &[u8]) -> Result<RasterImage> {
     let reader = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format().map_err(err)?;
     let kind = reader.format().ok_or_else(|| err("not an image VectorCraft reads (see document.formats)"))?;
     let f = image_format(kind).ok_or_else(|| err(format!("{kind:?} images can't be opened (see document.formats)")))?;
+    let (width, height) = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format().map_err(err)?.into_dimensions().map_err(err)?;
+    if width == 0 || height == 0 {
+        return Err(err("the image is empty"));
+    }
+    const MAX_RASTER_PIXELS: u64 = 100_000_000;
+    if width > vectorcraft_render::MAX_RASTER_SIDE
+        || height > vectorcraft_render::MAX_RASTER_SIDE
+        || u64::from(width) * u64::from(height) > MAX_RASTER_PIXELS
+    {
+        return Err(err("image exceeds maximum dimensions"));
+    }
     let ppi = super::ppi::resolution(bytes);
     let cmyk = || ImageBlob::new(f.mime, bytes.to_vec()).cmyk().is_some();
     let (bytes, mime, (width, height)) = if matches!(f.id, "png" | "jpg" | "gif" | "webp") || (f.id == "tiff" && cmyk()) {
-        (bytes.to_vec(), f.mime, reader.into_dimensions().map_err(err)?)
+        (bytes.to_vec(), f.mime, (width, height))
     } else {
         let img = reader.decode().map_err(err)?.to_rgba8();
         let size = img.dimensions();
@@ -304,9 +342,6 @@ pub fn raster_image(bytes: &[u8]) -> Result<RasterImage> {
         };
         (png, "image/png", size)
     };
-    if width == 0 || height == 0 {
-        return Err(err("the image is empty"));
-    }
     let blob = ImageBlob::new(mime, bytes);
     Ok(RasterImage { key: blob.content_key(), blob, width, height, ppi })
 }

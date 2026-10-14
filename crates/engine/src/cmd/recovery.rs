@@ -463,6 +463,10 @@ pub fn claim(s: &mut Session, store: &Arc<dyn RecoveryStore>) -> Result<String> 
             Lock::Held(h) => (Some(h), false),
             Lock::Busy => continue,
             Lock::Unsupported => {
+                let fresh = store.announced(&area).unwrap_or(false) || beating(store.as_ref(), &area, stale_after(s), None);
+                if fresh {
+                    continue;
+                }
                 beat(store.as_ref(), &area).map_err(EngineError::Other)?;
                 (store.announce(&area), true)
             }
@@ -483,8 +487,8 @@ pub fn release(s: &mut Session) {
     for name in store.list().unwrap_or_default().iter().filter(|n| mine(n)) {
         let _ = store.remove(name);
     }
-    drop(hold);
     store.remove_area(&area);
+    drop(hold);
 }
 
 /// Let go of this session's area but leave its copies, as a crash would, so the next app started
@@ -525,8 +529,22 @@ struct Meta {
     saved: Option<i64>,
 }
 
+impl Meta {
+    fn sanitize(&mut self) {
+        if let Some(p) = &self.path {
+            let has_null = p.contains('\0');
+            let has_parent = std::path::Path::new(p).components().any(|c| matches!(c, std::path::Component::ParentDir));
+            if has_null || has_parent {
+                self.path = None;
+            }
+        }
+    }
+}
+
 fn read_meta(store: &dyn RecoveryStore, file: &str) -> Meta {
-    store.read(&format!("{file}{META_EXT}")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+    let mut meta: Meta = store.read(&format!("{file}{META_EXT}")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    meta.sanitize();
+    meta
 }
 
 /// A copy of one document, snapshotted and ready to encode and store anywhere (the background
@@ -747,8 +765,8 @@ fn tidy(store: &dyn RecoveryStore, area: &str, hold: Vec<Hold>) {
     for n in mine {
         let _ = store.remove(n);
     }
-    drop(hold);
     store.remove_area(area);
+    drop(hold);
 }
 
 /// The copies of documents open now in this session.
@@ -817,7 +835,9 @@ fn targets(s: &mut Session, store: &dyn RecoveryStore, cmd: &str, p: &Value) -> 
 fn restore_one(s: &mut Session, store: &Arc<dyn RecoveryStore>, file: &str) -> Result<Value> {
     let bytes = store.read(&format!("{file}{DOC_EXT}")).map_err(EngineError::Other)?;
     let meta_bytes = store.read(&format!("{file}{META_EXT}")).unwrap_or_default();
-    let meta: Meta = serde_json::from_slice(&meta_bytes).unwrap_or_default();
+    let mut meta: Meta = serde_json::from_slice(&meta_bytes).unwrap_or_default();
+    meta.sanitize();
+    let meta_bytes = serde_json::to_vec_pretty(&meta).unwrap_or(meta_bytes);
     let (mut doc, _, warnings) = fileio::native_file(&bytes).map_err(|e| EngineError::Other(format!("recovery copy `{file}`: {e}")))?;
     let area = claim(s, store)?;
     let mut taken: Vec<String> = copies_in(&store.list().map_err(EngineError::Other)?).into_iter().map(|(_, f)| f).collect();

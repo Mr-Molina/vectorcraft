@@ -1,0 +1,204 @@
+﻿diff --git a/crates/engine/src/cmd/colorcmds.rs b/crates/engine/src/cmd/colorcmds.rs
+index 01b07a5..5a5b172 100644
+--- a/crates/engine/src/cmd/colorcmds.rs
++++ b/crates/engine/src/cmd/colorcmds.rs
+@@ -110,20 +110,29 @@ pub fn specs() -> Vec<CommandSpec> {
+         ),
+         cmd!(
+             query "color.harmony",
+             "Color Guide",
+             [],
+             None,
+             "{color, rule: complementary|complementary2|splitComplementary|leftComplement|rightComplement|analogous|analogous2|monochromatic|shades|triad|triad2|triad3|tetrad|tetrad2|tetrad3|compound|compound2|highContrast|highContrast2|highContrast3|pentagram (or its label), steps?: 1..20 (4), variation?: \"tintsShades\"|\"warmCool\"|\"vividMuted\", amount?: 0..100 (50; how far the outermost steps go), limitTo?: swatch library id or name, or \"document\" (the document's swatches): every colour snaps to its nearest colour there (╬öE 2000)} the Color Guide for a base colour ΓåÆ {rule, colors: [\"#rrggbb\", the base first], grid: [per colour, 2┬╖steps+1 variations from shades/cool/muted to tints/warm/vivid with the colour itself in the centre]}",
+             always,
+             harmony
+         ),
++        cmd!(
++            "color.cluster",
++            "Cluster by Color",
++            ["Object", "Color"],
++            None,
++            "{max_delta_e: float, action: 'preview'|'group', node_ids?: [int]}",
++            has_doc,
++            color_cluster
++        ),
+     ]
+ }
+ 
+ /// The RGB inverse of `c`, expressed in `c`'s colour model.
+ pub(crate) fn invert(c: Color) -> Color {
+     c.invert_keep_model()
+ }
+ 
+ pub(crate) fn to_cmyk(c: Color) -> Color {
+     c.in_model(Model::Cmyk)
+@@ -515,10 +524,88 @@ fn harmony(s: &mut Session, p: &Value) -> Result<Value> {
+     if let Some(a) = p.get("amount").and_then(Value::as_f64) {
+         opts.amount = a as f32;
+     }
+     let mut g = Guide::new(base, rule, &opts);
+     if let Some(palette) = super::swatchlib::limit_param(s, p, C)? {
+         g = g.limited(&palette);
+     }
+     let hex = |cs: &[Color]| cs.iter().map(Color::to_hex).collect::<Vec<_>>();
+     Ok(json!({ "rule": rule.id(), "colors": hex(&g.colors), "grid": g.grid.iter().map(|r| hex(r)).collect::<Vec<_>>() }))
+ }
++
++fn color_cluster(s: &mut Session, p: &Value) -> Result<Value> {
++    let max_delta_e = p.get("max_delta_e").and_then(Value::as_f64).ok_or_else(|| bad("color.cluster", "missing or invalid max_delta_e"))?;
++    if !max_delta_e.is_finite() || max_delta_e <= 0.0 {
++        return Err(bad("color.cluster", "max_delta_e must be a positive finite number"));
++    }
++    let action = p.get("action").and_then(Value::as_str).unwrap_or("preview");
++    if action != "preview" && action != "group" {
++        return Err(bad("color.cluster", "action must be 'preview' or 'group'"));
++    }
++
++    let doc_handle = s.doc()?;
++    let doc = &doc_handle.doc;
++    let target_ids: Vec<NodeId> = if let Some(arr) = p.get("node_ids").and_then(Value::as_array) {
++        arr.iter().filter_map(Value::as_u64).map(NodeId).collect()
++    } else {
++        doc.layers.iter().flat_map(|l| l.children().into_iter().flatten().map(|c| c.id)).collect()
++    };
++
++    let mut items: Vec<(u64, Color)> = Vec::new();
++    for &id in &target_ids {
++        if let Some(node) = doc.node(id)
++            && let Some(col) = node.appearance.fill_paint().color()
++        {
++            items.push((id.0, col));
++        }
++    }
++
++    let clusters = vectorcraft_color::recolor::cluster_colors_by_delta_e(&items, max_delta_e);
++    let cluster_json: Vec<Value> = clusters
++        .iter()
++        .map(|c| {
++            let [r, g, b, _] = c.representative.to_rgba8(1.0);
++            json!({
++                "group_name": format!("Color #{r:02x}{g:02x}{b:02x}"),
++                "hex": format!("#{r:02x}{g:02x}{b:02x}"),
++                "node_ids": c.node_ids,
++                "avg_delta_e": c.avg_delta_e
++            })
++        })
++        .collect();
++
++    if action == "preview" {
++        return Ok(json!({
++            "clusters": cluster_json,
++            "modified_node_count": 0
++        }));
++    }
++
++    if action == "group" {
++        let mut modified = 0;
++        s.edit("Cluster by Color", |d, _sel| {
++            for c in &clusters {
++                let [r, g, b, _] = c.representative.to_rgba8(1.0);
++                let group_name = format!("Color #{r:02x}{g:02x}{b:02x}");
++                let gid = d.alloc_id();
++                let mut gnode = Node::group(gid, vec![]);
++                gnode.name = Some(group_name);
++                if let Some(first_id) = c.node_ids.first()
++                    && let Some((par, idx, _)) = d.position(NodeId(*first_id))
++                {
++                    d.insert(par, idx + 1, gnode)?;
++                    for &nid in &c.node_ids {
++                        d.move_node(NodeId(nid), Some(gid), usize::MAX)?;
++                        modified += 1;
++                    }
++                }
++            }
++            Ok(())
++        })?;
++        return Ok(json!({
++            "clusters": cluster_json,
++            "modified_node_count": modified
++        }));
++    }
++
++    Err(bad("color.cluster", "action must be 'preview' or 'group'"))
++}
+diff --git a/crates/engine/tests/color_cluster_test.rs b/crates/engine/tests/color_cluster_test.rs
+new file mode 100644
+index 0000000..b60a326
+--- /dev/null
++++ b/crates/engine/tests/color_cluster_test.rs
+@@ -0,0 +1,75 @@
++//! Integration tests for `color.cluster`.
++#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
++
++use serde_json::json;
++use vectorcraft_engine::Session;
++
++#[test]
++fn test_color_cluster_preview_does_not_mutate() {
++    let mut s = Session::headless();
++    s.run("file.new", &json!({"width": 200, "height": 200})).unwrap();
++    s.run("shape.rectangle", &json!({"x": 10, "y": 10, "width": 20, "height": 20})).unwrap();
++    let res = s.run("color.cluster", &json!({"max_delta_e": 5.0, "action": "preview"})).unwrap();
++    assert_eq!(res["modified_node_count"], 0);
++}
++
++#[test]
++fn test_color_cluster_rejects_invalid_floats() {
++    let mut s = Session::headless();
++    s.run("file.new", &json!({"width": 200, "height": 200})).unwrap();
++    assert!(s.run("color.cluster", &json!({"max_delta_e": "NaN", "action": "preview"})).is_err());
++    assert!(s.run("color.cluster", &json!({"max_delta_e": f64::INFINITY, "action": "preview"})).is_err());
++}
++
++#[test]
++fn test_color_cluster_handles_missing_node_ids() {
++    let mut s = Session::headless();
++    s.run("file.new", &json!({"width": 200, "height": 200})).unwrap();
++    let res = s.run("color.cluster", &json!({"node_ids": [999999], "max_delta_e": 5.0, "action": "preview"})).unwrap();
++    assert_eq!(res["modified_node_count"], 0);
++}
++
++#[test]
++fn test_color_cluster_skips_empty_color_nodes() {
++    let mut s = Session::headless();
++    s.run("file.new", &json!({"width": 200, "height": 200})).unwrap();
++    let r1 = s.run("shape.rectangle", &json!({"x": 10, "y": 10, "width": 20, "height": 20})).unwrap()["id"].as_u64().unwrap();
++    s.run("paint.setFill", &json!({"ids": [r1], "none": true})).unwrap();
++
++    let res = s.run("color.cluster", &json!({"node_ids": [r1], "max_delta_e": 5.0, "action": "preview"})).unwrap();
++    assert_eq!(res["modified_node_count"], 0);
++    assert!(res["clusters"].as_array().unwrap().is_empty());
++}
++
++#[test]
++fn test_color_cluster_atomic_rollback_on_mid_batch_failure() {
++    let mut s = Session::headless();
++    s.run("file.new", &json!({"width": 200, "height": 200})).unwrap();
++    let r1 = s.run("shape.rectangle", &json!({"x": 10, "y": 10, "width": 20, "height": 20})).unwrap()["id"].as_u64().unwrap();
++    let r2 = s.run("shape.rectangle", &json!({"x": 40, "y": 40, "width": 20, "height": 20})).unwrap()["id"].as_u64().unwrap();
++
++    let pre_summary = s.run("document.semantic_summary", &json!({})).unwrap();
++
++    let err = s.run("color.cluster", &json!({"node_ids": [r1, r2], "max_delta_e": 10.0, "action": "invalid_mode_rollback"}));
++    assert!(err.is_err());
++
++    let post_summary = s.run("document.semantic_summary", &json!({})).unwrap();
++    assert_eq!(pre_summary, post_summary);
++}
++
++#[test]
++fn test_color_cluster_group_creates_groups_atomically_with_undo() {
++    let mut s = Session::headless();
++    s.run("file.new", &json!({"width": 200, "height": 200})).unwrap();
++    let r1 = s.run("shape.rectangle", &json!({"x": 10, "y": 10, "width": 20, "height": 20})).unwrap()["id"].as_u64().unwrap();
++    let r2 = s.run("shape.rectangle", &json!({"x": 40, "y": 40, "width": 20, "height": 20})).unwrap()["id"].as_u64().unwrap();
++
++    let res = s.run("color.cluster", &json!({"node_ids": [r1, r2], "max_delta_e": 10.0, "action": "group"})).unwrap();
++    assert_eq!(res["modified_node_count"], 2);
++
++    // Single undo restores initial ungrouped layout
++    s.run("edit.undo", &json!({})).unwrap();
++    let summary = s.run("document.semantic_summary", &json!({})).unwrap();
++    assert_eq!(summary["group_count"], 0);
++    assert_eq!(summary["loose_path_count"], 2);
++}

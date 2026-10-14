@@ -7,7 +7,13 @@ use crate::Session;
 
 fn rect_json(r: Option<vectorcraft_geom::Rect>) -> Value {
     match r {
-        Some(r) => json!({ "x": r.x0, "y": r.y0, "width": r.width(), "height": r.height() }),
+        Some(r) => {
+            if !r.x0.is_finite() || !r.y0.is_finite() || !r.x1.is_finite() || !r.y1.is_finite() {
+                Value::Null
+            } else {
+                json!({ "x": r.x0, "y": r.y0, "width": r.width(), "height": r.height() })
+            }
+        }
         None => Value::Null,
     }
 }
@@ -29,6 +35,24 @@ pub fn node_summary(n: &Node) -> Value {
 
 /// The same summary with [`SummaryOpts`] applied.
 pub fn node_summary_opts(n: &Node, opts: SummaryOpts) -> Value {
+    node_summary_opts_depth(n, opts, 0)
+}
+
+fn node_summary_opts_depth(n: &Node, opts: SummaryOpts, depth: usize) -> Value {
+    if depth >= SEMANTIC_MAX_DEPTH {
+        let mut v = json!({
+            "id": n.id.0,
+            "name": n.display_name(),
+            "kind": n.kind_label(),
+            "visible": n.visible,
+            "locked": n.locked,
+            "bounds": rect_json(n.geometric_bounds()),
+        });
+        if let Some(ch) = n.children() {
+            v["childCount"] = json!(ch.len());
+        }
+        return v;
+    }
     let mut v = json!({
         "id": n.id.0,
         "name": n.display_name(),
@@ -86,9 +110,9 @@ pub fn node_summary_opts(n: &Node, opts: SummaryOpts) -> Value {
     if let Some(ch) = n.children() {
         let total = ch.len();
         let take_n = opts.child_limit.map_or(total, |l| l.min(total as u64) as usize);
-        if opts.depth.is_none_or(|d| d > 0) {
+        if depth + 1 < SEMANTIC_MAX_DEPTH && opts.depth.is_none_or(|d| d > 0) {
             let next = SummaryOpts { depth: opts.depth.map(|d| d.saturating_sub(1)), child_limit: opts.child_limit };
-            v["children"] = Value::Array(ch.iter().rev().take(take_n).map(|c| node_summary_opts(c, next)).collect());
+            v["children"] = Value::Array(ch.iter().rev().take(take_n).map(|c| node_summary_opts_depth(c, next, depth + 1)).collect());
         }
         if take_n < total || v.get("children").is_none() {
             v["childCount"] = json!(total);
@@ -179,7 +203,10 @@ pub fn find_nodes(doc: &Document, filter: &FindFilter, limit: u64) -> (Vec<Value
     let mut out = Vec::new();
     let mut total = 0u64;
     let mut ancestors: Vec<u64> = Vec::new();
-    fn walk(nodes: &[Arc<Node>], ancestors: &mut Vec<u64>, filter: &FindFilter, limit: u64, out: &mut Vec<Value>, total: &mut u64) {
+    fn walk(nodes: &[Arc<Node>], ancestors: &mut Vec<u64>, depth: usize, filter: &FindFilter, limit: u64, out: &mut Vec<Value>, total: &mut u64) {
+        if depth >= SEMANTIC_MAX_DEPTH {
+            return;
+        }
         for n in nodes.iter().rev() {
             if filter.hits(n) {
                 *total += 1;
@@ -189,12 +216,12 @@ pub fn find_nodes(doc: &Document, filter: &FindFilter, limit: u64) -> (Vec<Value
             }
             if let Some(ch) = n.children() {
                 ancestors.push(n.id.0);
-                walk(ch, ancestors, filter, limit, out, total);
+                walk(ch, ancestors, depth + 1, filter, limit, out, total);
                 ancestors.pop();
             }
         }
     }
-    walk(&doc.layers, &mut ancestors, filter, limit, &mut out, &mut total);
+    walk(&doc.layers, &mut ancestors, 0, filter, limit, &mut out, &mut total);
     (out, total)
 }
 
@@ -253,64 +280,187 @@ pub struct StrokeMixed {
     pub can_align: bool,
 }
 
-/// Semantic summary of the document for agent consumption.
+/// `document.semantic_summary`: default number of palette entries returned.
+pub const SEMANTIC_PALETTE_DEFAULT: u64 = 32;
+/// `document.semantic_summary`: most palette entries a caller may ask for (`maxPalette` is capped).
+pub const SEMANTIC_PALETTE_MAX: u64 = 256;
+/// `document.semantic_summary`: object ids listed per palette entry (`count` still counts all).
+pub const SEMANTIC_SAMPLE_IDS: usize = 5;
+/// `document.semantic_summary`: deepest container level walked into. A hostile file can nest
+/// thousands of groups; the walk uses an explicit stack, and below this depth it stops and
+/// reports `depthCapped: true` rather than spending unbounded time and memory.
+pub const SEMANTIC_MAX_DEPTH: usize = 512;
+
+fn paint_hex(p: &vectorcraft_color::Paint) -> Option<String> {
+    if p.is_none() { None } else { Some(p.label()) }
+}
+
+/// A finite number as JSON, else an explicit `null` (no NaN or infinity reaches the reply).
+fn finite_json(v: f64) -> Value {
+    if v.is_finite() { json!(v) } else { Value::Null }
+}
+
+/// Semantic summary of the document for agent consumption (`document.semantic_summary`).
+///
+/// Params: `selectionOnly?: bool` (walk only the selected objects' subtrees), `maxPalette?:
+/// int` (default [`SEMANTIC_PALETTE_DEFAULT`], capped at [`SEMANTIC_PALETTE_MAX`]). A param of
+/// the wrong type is a `BadParams` error, never silently reinterpreted.
+///
+/// The whole layer tree is walked (sublayers, groups, clip groups, compound paths, blends,
+/// envelopes, repeats), up to [`SEMANTIC_MAX_DEPTH`] levels. What the keys count, within the
+/// walked scope:
+/// - `groupCount`: visible groups (`NodeKind::Group`, clip groups included). Layers and
+///   sublayers are not groups; compound paths, blends, envelopes and repeats are walked into
+///   but are not groups either.
+/// - `loosePathCount`: visible paths (`NodeKind::Path`) not inside any group or other
+///   non-layer container: direct children of a layer or sublayer. A path inside a group, a
+///   compound path, etc. is not loose, at any depth.
+/// - `hiddenCount`: objects and layers whose own visibility is off (plus selected roots under a
+///   hidden ancestor). Their subtrees are skipped: nothing in them counts anywhere else.
+/// - `totalNodes`: every visible non-layer object counted (containers included).
+/// - `palette`: fills of the visible objects as `{hex, count, sampleIds}`, most used first
+///   (ties by `hex` ascending), at most `maxPalette` entries; `sampleIds` holds at most
+///   [`SEMANTIC_SAMPLE_IDS`] ids, bottom of the stack first.
+/// - `backgroundCardId`: the bottom object of a visible top-level layer when it is visible, in
+///   scope and its bounds are within 2% of the first artboard's size and origin; else `null`.
+/// - `artboard`: the first artboard's `{width, height}` (each `null` when not finite), or
+///   `null` without artboards; `artboardCount`: how many there are.
+/// - `depthCapped`: true when a subtree went deeper than [`SEMANTIC_MAX_DEPTH`] and was not
+///   walked below it.
 pub fn semantic_summary(s: &Session, p: &Value) -> Result<Value, crate::EngineError> {
-    let doc_handle = s.doc()?;
-    let doc = &doc_handle.doc;
-    let selection_only = p.get("selection_only").and_then(Value::as_bool).unwrap_or(false);
-    let max_palette = p.get("max_palette_entries").and_then(Value::as_u64).unwrap_or(32) as usize;
+    const CMD: &str = "document.semantic_summary";
+    let selection_only = match p.get("selectionOnly") {
+        None | Some(Value::Null) => false,
+        Some(v) => v.as_bool().ok_or_else(|| crate::cmd::bad(CMD, "`selectionOnly` must be a boolean"))?,
+    };
+    let max_palette = match p.get("maxPalette") {
+        None | Some(Value::Null) => SEMANTIC_PALETTE_DEFAULT,
+        Some(v) => v.as_u64().ok_or_else(|| crate::cmd::bad(CMD, "`maxPalette` must be a non-negative integer"))?,
+    }
+    .min(SEMANTIC_PALETTE_MAX) as usize;
+
+    let st = s.doc()?;
+    let doc = &st.doc;
+    let selected: std::collections::HashSet<vectorcraft_doc::NodeId> = st.selection.objects.iter().copied().collect();
+
+    let mut total_nodes = 0u64;
+    let mut group_count = 0u64;
+    let mut loose_paths = 0u64;
+    let mut hidden_count = 0u64;
+    let mut depth_capped = false;
+    let mut palette_map: std::collections::HashMap<String, (u64, Vec<u64>)> = std::collections::HashMap::new();
+
+    struct Item<'a> {
+        node: &'a Node,
+        depth: usize,
+        /// Inside a group or other non-layer container.
+        in_group: bool,
+        /// Inside the walked scope (always, unless `selectionOnly`: inside a selected root).
+        counting: bool,
+        /// Under a hidden ancestor.
+        hidden: bool,
+    }
+    // Explicit stack (no recursion): children are pushed in reverse, so the bottom of the
+    // stack pops first and sample ids come out in stacking order.
+    let mut stack: Vec<Item> =
+        doc.layers.iter().rev().map(|l| Item { node: l, depth: 0, in_group: false, counting: !selection_only, hidden: false }).collect();
+    while let Some(item) = stack.pop() {
+        let n = item.node;
+        let root = selection_only && !item.counting && selected.contains(&n.id);
+        let counting = item.counting || root;
+        let hidden = item.hidden || !n.visible;
+        if hidden {
+            // Count the first hidden node on the way down (or a selected root under a hidden
+            // ancestor) once and skip its subtree. Outside the scope the walk goes on below it,
+            // hidden, only to find selected roots.
+            if counting {
+                if !item.hidden || root {
+                    hidden_count += 1;
+                }
+                continue;
+            }
+        } else if counting && !n.is_layer() {
+            total_nodes += 1;
+            match &n.kind {
+                NodeKind::Group { .. } => group_count += 1,
+                NodeKind::Path { .. } if !item.in_group => loose_paths += 1,
+                _ => {}
+            }
+            let fill_opt = paint_hex(&n.appearance.fill_paint()).or_else(|| {
+                if let NodeKind::Text(t) = &n.kind {
+                    let default_style = vectorcraft_doc::CharStyle::default();
+                    let style_fill = &t.runs.first().map_or(&default_style, |r| &r.style).fill;
+                    paint_hex(style_fill)
+                } else {
+                    None
+                }
+            });
+            if let Some(label) = fill_opt {
+                let entry = palette_map.entry(label).or_insert((0, Vec::new()));
+                entry.0 += 1;
+                if entry.1.len() < SEMANTIC_SAMPLE_IDS {
+                    entry.1.push(n.id.0);
+                }
+            }
+        }
+        if let Some(children) = n.children() {
+            if item.depth >= SEMANTIC_MAX_DEPTH {
+                depth_capped = true;
+                continue;
+            }
+            let in_group = item.in_group || !n.is_layer();
+            stack.extend(children.iter().rev().map(|c| Item { node: c, depth: item.depth + 1, in_group, counting, hidden }));
+        }
+    }
+
+    let mut palette: Vec<(String, (u64, Vec<u64>))> = palette_map.into_iter().collect();
+    palette.sort_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| a.0.cmp(&b.0)));
+    let palette: Vec<Value> =
+        palette.into_iter().take(max_palette).map(|(hex, (count, ids))| json!({ "hex": hex, "count": count, "sampleIds": ids })).collect();
 
     let artboard_rect = doc.artboards.first().map(|a| a.rect);
     let mut bg_card_id = None;
-    let mut total_nodes = 0;
-    let mut group_count = 0;
-    let mut loose_paths = 0;
-    let mut palette_map: std::collections::BTreeMap<String, (usize, Vec<u64>)> = std::collections::BTreeMap::new();
-
-    for layer in &doc.layers {
-        let Some(children) = layer.children() else { continue };
-        for (idx, child) in children.iter().enumerate() {
-            if selection_only && !doc_handle.selection.contains(child.id) {
+    if let Some(ab) = artboard_rect
+        && ab.width() > 0.0
+        && ab.height() > 0.0
+    {
+        for layer in doc.layers.iter().filter(|l| l.visible) {
+            let Some(child) = layer.children().and_then(|c| c.first()) else { continue };
+            if !child.visible || child.is_layer() || (selection_only && !selected.contains(&child.id)) {
                 continue;
             }
-            total_nodes += 1;
-            if child.is_container() {
-                group_count += 1;
-            } else {
-                loose_paths += 1;
-            }
-            if idx == 0
-                && bg_card_id.is_none()
-                && let (Some(ab), Some(gb)) = (artboard_rect, child.geometric_bounds())
+            let Some(gb) = child.geometric_bounds() else { continue };
+            let dw = (ab.width() - gb.width()).abs();
+            let dh = (ab.height() - gb.height()).abs();
+            let dx = (ab.x0 - gb.x0).abs();
+            let dy = (ab.y0 - gb.y0).abs();
+            if dw.is_finite()
+                && dh.is_finite()
+                && dx.is_finite()
+                && dy.is_finite()
+                && dw <= ab.width() * 0.02
+                && dh <= ab.height() * 0.02
+                && dx <= ab.width() * 0.02
+                && dy <= ab.height() * 0.02
             {
-                let dw = (ab.width() - gb.width()).abs();
-                let dh = (ab.height() - gb.height()).abs();
-                if dw <= ab.width() * 0.02 && dh <= ab.height() * 0.02 {
-                    bg_card_id = Some(child.id.0);
-                }
-            }
-            let fill = child.appearance.fill_paint();
-            if !fill.is_none() {
-                let hex = fill.label();
-                let entry = palette_map.entry(hex).or_insert((0, Vec::new()));
-                entry.0 += 1;
-                if entry.1.len() < 5 {
-                    entry.1.push(child.id.0);
-                }
+                bg_card_id = Some(child.id.0);
+                break;
             }
         }
     }
 
-    let palette: Vec<Value> =
-        palette_map.into_iter().take(max_palette).map(|(hex, (count, ids))| json!({ "hex": hex, "count": count, "sample_node_ids": ids })).collect();
-
     Ok(json!({
-        "artboard": artboard_rect.map(|r| json!({"width": r.width(), "height": r.height()})).unwrap_or(Value::Null),
-        "artboard_count": doc.artboards.len(),
-        "background_card_id": bg_card_id,
-        "total_nodes": total_nodes,
-        "group_count": group_count,
-        "loose_path_count": loose_paths,
-        "palette": palette
+        "artboard": match artboard_rect {
+            Some(r) => json!({ "width": finite_json(r.width()), "height": finite_json(r.height()) }),
+            None => Value::Null,
+        },
+        "artboardCount": doc.artboards.len(),
+        "backgroundCardId": bg_card_id,
+        "totalNodes": total_nodes,
+        "groupCount": group_count,
+        "loosePathCount": loose_paths,
+        "hiddenCount": hidden_count,
+        "depthCapped": depth_capped,
+        "palette": palette,
     }))
 }

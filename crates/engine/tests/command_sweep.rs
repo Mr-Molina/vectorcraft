@@ -299,6 +299,22 @@ fn structured_junk() {
         ("object.puppetWarp", json!({"rest": true, "pins": [[1e308, 0]], "moved": [[0, 0]], "expand": -5})),
         ("object.puppetWarp", json!({"rest": true, "ids": [u64::MAX], "pins": [[0, 0]], "moved": [[0, 0]]})),
         ("object.puppetWarp.pins", json!({"ids": [0, 1, 2], "expand": 1e308})),
+        ("color.cluster", json!({"tolerance": f64::NAN, "ids": [999999]})),
+        ("color.cluster", json!({"tolerance": -5.0, "ids": [999999, u64::MAX, -1]})),
+        ("color.cluster", json!({"maxDeltaE": -5.0, "ids": [999999]})),
+        ("color.cluster", json!({"maxDeltaE": 1e308, "ids": []})),
+        ("color.cluster", json!({"maxDeltaE": "NaN", "ids": [0]})),
+        ("edit.colors.groupByColor", json!({"tolerance": f64::NAN, "ids": [999999]})),
+        ("edit.colors.groupByColor", json!({"tolerance": -5.0, "ids": [999999, -1]})),
+        ("edit.colors.groupByColor", json!({"maxDeltaE": -5.0, "ids": [999999]})),
+        ("edit.colors.groupByColor", json!({"maxDeltaE": 1e308, "ids": [999999]})),
+        ("edit.colors.groupByColor", json!({"maxDeltaE": "NaN", "ids": [1]})),
+        ("render.overlay", json!({"path": "../traversal.png", "dpi": 999999.0})),
+        ("render.overlay", json!({"path": "C:\\Windows\\traversal.png", "scale": 1.0})),
+        ("render.overlay", json!({"ids": [999999, u64::MAX, -1], "scale": -5.0})),
+        ("render.overlay", json!({"scale": 1e308, "dpi": -1.0})),
+        ("render.overlay", json!({"artboard": 999999, "ungroupedOnly": "not-a-bool"})),
+        ("render.overlay", json!({"ids": [999999], "path": "../traversal.png", "dpi": 999999.0, "tolerance": -5.0, "scale": f64::NAN})),
     ];
     let mut failures = vec![];
     for fx in Fixture::ALL {
@@ -341,6 +357,15 @@ fn fuzzed_calls_keep_documents_serializable() {
     assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.iter().take(40).cloned().collect::<Vec<_>>().join("\n"));
 }
 
+fn default_valid_params(id: &str) -> Value {
+    match id {
+        "color.cluster" => json!({ "tolerance": 10.0 }),
+        "edit.colors.groupByColor" => json!({ "tolerance": 10.0 }),
+        "render.overlay" => json!({ "dpi": 72.0 }),
+        _ => json!({}),
+    }
+}
+
 /// Undo after any successful command in the Multi fixture restores the exact document.
 #[test]
 fn every_command_undoes_exactly() {
@@ -352,7 +377,8 @@ fn every_command_undoes_exactly() {
         let mut s = Fixture::Multi.session();
         let before = doc_json(&s.doc().unwrap().doc);
         let depth = s.doc().unwrap().history.undo.len();
-        let Ok(Ok(_)) = catch_quiet(|| s.execute(c.id, &json!({}))) else { continue };
+        let params = default_valid_params(c.id);
+        let Ok(Ok(_)) = catch_quiet(|| s.execute(c.id, &params)) else { continue };
         if s.doc().unwrap().history.undo.len() > depth {
             let _ = s.execute("edit.undo", &json!({}));
             let after = doc_json(&s.doc().unwrap().doc);

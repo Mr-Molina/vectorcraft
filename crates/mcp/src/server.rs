@@ -13,6 +13,9 @@ use crate::tools::{call_tool, tool_definitions};
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 const SUPPORTED_VERSIONS: &[&str] = &[PROTOCOL_VERSION, "2025-03-26", "2024-11-05"];
 
+const MAX_REQUEST_LINE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_BATCH_ITEMS: usize = 100;
+
 const PARSE_ERROR: i64 = -32700;
 const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
@@ -77,10 +80,28 @@ impl Server {
 
     /// Serve newline-delimited JSON-RPC until `input` closes. Logs go to stderr only (stdout is
     /// the protocol stream).
-    pub fn serve(&mut self, input: impl BufRead, mut output: impl Write) -> std::io::Result<()> {
-        for line in input.lines() {
-            let line = line?;
-            let reply = self.handle_line(&line);
+    pub fn serve(&mut self, mut input: impl BufRead, mut output: impl Write) -> std::io::Result<()> {
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            let n = std::io::Read::take(&mut input, (MAX_REQUEST_LINE_BYTES as u64) + 1).read_line(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            if buf.len() > MAX_REQUEST_LINE_BYTES {
+                while !buf.ends_with('\n') {
+                    buf.clear();
+                    if std::io::Read::take(&mut input, 64 * 1024).read_line(&mut buf)? == 0 {
+                        break;
+                    }
+                }
+                let err_reply = error(Value::Null, INVALID_REQUEST, "request line too large").to_string();
+                output.write_all(err_reply.as_bytes())?;
+                output.write_all(b"\n")?;
+                output.flush()?;
+                continue;
+            }
+            let reply = self.handle_line(&buf);
             let notes = self.take_notifications();
             for line in reply.iter().chain(notes.iter()) {
                 output.write_all(line.as_bytes())?;
@@ -93,6 +114,9 @@ impl Server {
 
     /// Handle one line; returns the reply line (None for notifications and blank lines).
     pub fn handle_line(&mut self, line: &str) -> Option<String> {
+        if line.len() > MAX_REQUEST_LINE_BYTES {
+            return Some(error(Value::Null, INVALID_REQUEST, "request line too large").to_string());
+        }
         let line = line.trim();
         if line.is_empty() {
             return None;
@@ -100,7 +124,9 @@ impl Server {
         let reply = match serde_json::from_str::<Value>(line) {
             Ok(Value::Array(batch)) => {
                 // Batches were removed in 2025-06-18; still answer older clients sensibly.
-                if batch.is_empty() {
+                if batch.len() > MAX_BATCH_ITEMS {
+                    Some(error(Value::Null, INVALID_REQUEST, "Invalid Request: batch too large"))
+                } else if batch.is_empty() {
                     Some(error(Value::Null, INVALID_REQUEST, "empty batch"))
                 } else {
                     let replies: Vec<Value> = batch.into_iter().filter_map(|m| self.handle(m)).collect();

@@ -284,6 +284,10 @@ impl RowMap {
 
     /// The new colour of current colour `c`, in `c`'s model.
     pub fn map(&self, c: Color) -> Color {
+        let l = c.to_lab().l;
+        if !l.is_finite() {
+            return c;
+        }
         let to = keep_model(c, self.to);
         match self.method {
             Method::Exact => to,
@@ -316,7 +320,7 @@ pub fn cluster(colors: &[Color], weights: &[f32], n: usize) -> Vec<Vec<usize>> {
             [l.l * 0.5, l.a, l.b]
         })
         .collect();
-    let w = |i: usize| weights.get(i).copied().unwrap_or(1.0).max(1e-6);
+    let w = |i: usize| weights.get(i).copied().filter(|v| v.is_finite() && *v > 0.0).unwrap_or(1.0).max(1e-6);
     let d2 = |a: &[f32; 3], b: &[f32; 3]| (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2);
     let n = n.max(1);
     if pts.is_empty() {
@@ -419,48 +423,127 @@ impl Rng {
     }
 }
 
-/// A cluster of similar colours mapped to a representative colour and the node IDs possessing them.
+/// A cluster of similar colours: its representative colour and the objects that have them.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ColorCluster {
+    /// The leader's colour: the colour every member is within the threshold of.
     pub representative: Color,
+    /// Member ids, ascending. The first id with the representative's exact colour is the
+    /// representative object.
     pub node_ids: Vec<u64>,
+    /// Mean CIEDE2000 distance to the representative over the members other than the
+    /// representative object (members with its exact colour count as 0); 0 for a single member.
     pub avg_delta_e: f64,
 }
 
-/// Clusters colors by CIEDE2000 delta E threshold.
+/// CIEDE2000's lightness weight S_L at mean lightness `l_mean`. It grows with |l_mean − 50|.
+fn s_l(l_mean: f64) -> f64 {
+    let d2 = (l_mean - 50.0).powi(2);
+    1.0 + 0.015 * d2 / (20.0 + d2).sqrt()
+}
+
+/// An exact colour identity for deduplication: the model and the components' bit patterns
+/// (−0.0 read as 0.0). Unlike [`ColorKey`] it neither rounds nor clamps (Lab L may leave 0..100).
+#[derive(PartialEq, Eq, Hash)]
+struct ExactKey(u8, [u32; 4]);
+
+impl ExactKey {
+    fn of(c: &Color) -> Self {
+        let b = |x: f32| if x == 0.0 { 0 } else { x.to_bits() };
+        match *c {
+            Color::Rgb { r, g, b: bl } => Self(0, [b(r), b(g), b(bl), 0]),
+            Color::Cmyk { c, m, y, k } => Self(1, [b(c), b(m), b(y), b(k)]),
+            Color::Gray { k } => Self(2, [b(k), 0, 0, 0]),
+            Color::Lab { l, a, b: bb } => Self(3, [b(l), b(a), b(bb), 0]),
+        }
+    }
+}
+
+/// Leader clustering of `(id, colour)` pairs by CIEDE2000 distance (kL = kC = kH = 1).
+///
+/// Exact duplicates (same model and components) are merged first and converted to Lab once. The
+/// unique colours are then visited in a total order (L, a, b by `total_cmp`, then smallest id),
+/// so the result does not depend on the order of `items`. Each colour joins the nearest existing
+/// leader within `max_delta_e` (the earliest on ties) or becomes a new leader.
+///
+/// This is *leader* clustering, not complete-linkage: every member is within `max_delta_e` of
+/// its leader, but two members of one cluster can be up to about `2 · max_delta_e` apart.
+/// `max_delta_e` 0 groups exact matches only. A negative or non-finite threshold gives no
+/// clusters; colours whose Lab is not finite each stay alone.
 pub fn cluster_colors_by_delta_e(items: &[(u64, Color)], max_delta_e: f64) -> Vec<ColorCluster> {
-    if items.is_empty() || !max_delta_e.is_finite() || max_delta_e <= 0.0 {
+    cluster_impl(items, max_delta_e, true)
+}
+
+/// [`cluster_colors_by_delta_e`]; `prune` skips leaders whose lightness alone puts them out of
+/// reach (the result is the same either way; tests compare the two).
+fn cluster_impl(items: &[(u64, Color)], max_delta_e: f64, prune: bool) -> Vec<ColorCluster> {
+    if items.is_empty() || !max_delta_e.is_finite() || max_delta_e < 0.0 {
         return Vec::new();
     }
-    let mut out: Vec<ColorCluster> = Vec::new();
-    let items_lab: Vec<(u64, Color, Lab)> = items.iter().map(|&(id, c)| (id, c, c.to_lab())).collect();
+    // Exact duplicates: colour → (colour of the smallest id, ids).
+    let mut unique: std::collections::HashMap<ExactKey, (u64, Color, Vec<u64>)> = std::collections::HashMap::new();
+    for &(id, c) in items {
+        let e = unique.entry(ExactKey::of(&c)).or_insert((id, c, Vec::new()));
+        if id < e.0 {
+            (e.0, e.1) = (id, c);
+        }
+        e.2.push(id);
+    }
+    let mut unique: Vec<(Lab, u64, Color, Vec<u64>)> = unique
+        .into_values()
+        .map(|(min_id, c, mut ids)| {
+            ids.sort_unstable();
+            ids.dedup();
+            (c.to_lab(), min_id, c, ids)
+        })
+        .collect();
+    unique.sort_by(|x, y| x.0.l.total_cmp(&y.0.l).then(x.0.a.total_cmp(&y.0.a)).then(x.0.b.total_cmp(&y.0.b)).then(x.1.cmp(&y.1)));
 
-    for &(id, col, col_lab) in &items_lab {
-        let mut best_match: Option<(usize, f64)> = None;
-        for (i, cluster) in out.iter().enumerate() {
-            let rep_lab = cluster.representative.to_lab();
-            let de = delta_e2000(rep_lab, col_lab) as f64;
-            if de <= max_delta_e {
-                if let Some((_, best_de)) = best_match {
-                    if de < best_de {
-                        best_match = Some((i, de));
-                    }
-                } else {
-                    best_match = Some((i, de));
+    let finite = |l: &Lab| l.l.is_finite() && l.a.is_finite() && l.b.is_finite();
+    // ΔE00 ≥ |ΔL| / S_L(L̄), and L̄ of any two colours lies between the smallest and largest L,
+    // so S_L at the extreme farthest from 50 bounds every pair (any finite L, not only 0..100).
+    // The small factor absorbs rounding.
+    let far = unique.iter().filter(|u| finite(&u.0)).map(|u| (u.0.l as f64 - 50.0).abs()).fold(0.0, f64::max);
+    let reach_span = s_l(50.0 + far) * 1.0001 * max_delta_e;
+    // Leaders with finite Lab, in creation order. Unique colours arrive sorted by L, so their L
+    // values ascend and a binary search skips the ones too dark to be within reach.
+    let mut leaders: Vec<(Lab, usize)> = Vec::new();
+    // Per cluster: (representative colour, ids, sum of member ΔE, number of ΔE terms).
+    let mut out: Vec<(Color, Vec<u64>, f64, usize)> = Vec::new();
+    for (lab, _, color, ids) in unique {
+        let mut best: Option<(usize, f64)> = None;
+        if finite(&lab) {
+            let reach = lab.l as f64 - reach_span;
+            let start = if prune && reach.is_finite() { leaders.partition_point(|(r, _)| (r.l as f64) < reach) } else { 0 };
+            for (rep, idx) in leaders.get(start..).unwrap_or_default() {
+                let de = delta_e2000(*rep, lab) as f64;
+                if de <= max_delta_e && best.is_none_or(|(_, b)| de < b) {
+                    best = Some((*idx, de));
                 }
             }
         }
-
-        if let Some((idx, de)) = best_match {
-            let cl = &mut out[idx];
-            let old_len = cl.node_ids.len() as f64;
-            cl.avg_delta_e = (cl.avg_delta_e * old_len + de) / (old_len + 1.0);
-            cl.node_ids.push(id);
-        } else {
-            out.push(ColorCluster { representative: col, node_ids: vec![id], avg_delta_e: 0.0 });
+        match best.and_then(|(idx, de)| out.get_mut(idx).map(|c| (c, de))) {
+            Some((cl, de)) => {
+                cl.2 += de * ids.len() as f64;
+                cl.3 += ids.len();
+                cl.1.extend(ids);
+            }
+            None => {
+                if finite(&lab) {
+                    leaders.push((lab, out.len()));
+                }
+                // The representative object itself contributes no ΔE term; its exact twins add 0.
+                let terms = ids.len().saturating_sub(1);
+                out.push((color, ids, 0.0, terms));
+            }
         }
     }
-    out
+    out.into_iter()
+        .map(|(representative, mut node_ids, sum, terms)| {
+            node_ids.sort_unstable();
+            ColorCluster { representative, node_ids, avg_delta_e: if terms == 0 { 0.0 } else { sum / terms as f64 } }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -635,8 +718,8 @@ mod tests {
         let blue = (3, Color::rgb(0.1, 0.1, 0.9));
         let clusters = cluster_colors_by_delta_e(&[red1, red2, blue], 5.0);
         assert_eq!(clusters.len(), 2);
-        assert_eq!(clusters[0].node_ids, vec![1, 2]);
-        assert_eq!(clusters[1].node_ids, vec![3]);
+        let ids: Vec<Vec<u64>> = clusters.iter().map(|c| c.node_ids.clone()).collect();
+        assert!(ids.contains(&vec![1, 2]) && ids.contains(&vec![3]), "{ids:?}");
     }
 
     #[test]
@@ -646,5 +729,127 @@ mod tests {
         assert!(cluster_colors_by_delta_e(&[red], f64::INFINITY).is_empty());
         assert!(cluster_colors_by_delta_e(&[red], -1.0).is_empty());
         assert!(cluster_colors_by_delta_e(&[], 5.0).is_empty());
+    }
+
+    #[test]
+    fn cluster_threshold_zero_is_exact_match() {
+        let a = Color::rgb(0.5, 0.2, 0.1);
+        let items = [(1, a), (2, Color::rgb(0.501, 0.2, 0.1)), (3, a)];
+        let c = cluster_colors_by_delta_e(&items, 0.0);
+        let ids: Vec<Vec<u64>> = c.iter().map(|c| c.node_ids.clone()).collect();
+        assert_eq!(c.len(), 2, "{ids:?}");
+        assert!(ids.contains(&vec![1, 3]) && ids.contains(&vec![2]));
+    }
+
+    #[test]
+    fn cluster_is_independent_of_input_order() {
+        // A chain of reds, each about 2–3 ΔE from the next: leader clustering is order sensitive
+        // unless the colours are visited in a fixed order.
+        let items: Vec<(u64, Color)> = (0..12).map(|i| (i as u64 + 10, Color::rgb(0.95 - i as f32 * 0.02, 0.1, 0.1))).collect();
+        let norm = |mut v: Vec<ColorCluster>| {
+            v.sort_by_key(|c| c.node_ids.first().copied());
+            v
+        };
+        let base = norm(cluster_colors_by_delta_e(&items, 4.0));
+        assert!(base.len() > 1, "the chain spans more than one cluster");
+        let mut rng = Rng::new(11);
+        for _ in 0..20 {
+            let mut p = items.clone();
+            rng.shuffle(&mut p);
+            assert_eq!(norm(cluster_colors_by_delta_e(&p, 4.0)), base);
+        }
+        let mut rev = items.clone();
+        rev.reverse();
+        assert_eq!(norm(cluster_colors_by_delta_e(&rev, 4.0)), base);
+    }
+
+    #[test]
+    fn cluster_average_excludes_the_representative() {
+        let a = Color::rgb(0.9, 0.1, 0.1);
+        let b = Color::rgb(0.91, 0.11, 0.1);
+        let single = cluster_colors_by_delta_e(&[(1, a)], 5.0);
+        assert_eq!(single[0].avg_delta_e, 0.0);
+        let twins = cluster_colors_by_delta_e(&[(1, a), (2, a)], 5.0);
+        assert_eq!((twins.len(), twins[0].avg_delta_e), (1, 0.0));
+        let pair = cluster_colors_by_delta_e(&[(1, a), (2, b)], 5.0);
+        assert_eq!(pair.len(), 1);
+        let de = delta_e2000(pair[0].representative.to_lab(), if pair[0].representative == a { b } else { a }.to_lab()) as f64;
+        assert!((pair[0].avg_delta_e - de).abs() < 1e-9, "{} vs {de}", pair[0].avg_delta_e);
+        assert!(de > 0.0);
+    }
+
+    #[test]
+    fn cluster_handles_many_distinct_colours() {
+        // 4096 distinct colours: pruning by lightness keeps this quick and the result complete.
+        let items: Vec<(u64, Color)> =
+            (0..4096u64).map(|i| (i, Color::rgb8((i % 16 * 16) as u8, (i / 16 % 16 * 16) as u8, (i / 256 * 16) as u8))).collect();
+        let c = cluster_colors_by_delta_e(&items, 3.0);
+        let total: usize = c.iter().map(|c| c.node_ids.len()).sum();
+        assert_eq!(total, items.len());
+        for cl in &c {
+            let rep = cl.representative.to_lab();
+            for id in &cl.node_ids {
+                let col = items.iter().find(|x| x.0 == *id).map(|x| x.1).unwrap();
+                assert!(delta_e2000(rep, col.to_lab()) as f64 <= 3.0);
+            }
+        }
+    }
+
+    #[test]
+    fn pruning_holds_for_lightness_outside_0_100() {
+        // S_L(104) ≈ 1.807 > 1.8: a fixed 1.8 bound would have pruned the L = 99 leader.
+        let items = [(1, Color::lab(99.0, 0.0, 0.0)), (2, Color::lab(109.0, 0.0, 0.0))];
+        let de = delta_e2000(Lab::new(99.0, 0.0, 0.0), Lab::new(109.0, 0.0, 0.0)) as f64;
+        assert!(de < 5.54 && 10.0 / de > 1.8, "{de}");
+        let pruned = cluster_impl(&items, 5.54, true);
+        assert_eq!(pruned, cluster_impl(&items, 5.54, false));
+        assert_eq!(pruned.len(), 1, "within the threshold: one cluster");
+    }
+
+    #[test]
+    fn pruned_matches_naive_on_random_lab() {
+        let mut rng = Rng::new(2024);
+        for round in 0..60 {
+            let n = 20 + round * 3;
+            let items: Vec<(u64, Color)> = (0..n as u64)
+                .map(|i| {
+                    let (l, a, b) = (rng.range(-20.0, 130.0), rng.range(-40.0, 40.0), rng.range(-40.0, 40.0));
+                    // Some exact repeats too.
+                    if i % 7 == 3 { (i, Color::lab(l.round(), 0.0, 0.0)) } else { (i, Color::lab(l, a, b)) }
+                })
+                .collect();
+            for t in [0.0, 1.0, 3.5, 8.0, 25.0] {
+                assert_eq!(cluster_impl(&items, t, true), cluster_impl(&items, t, false), "round {round} t {t}");
+            }
+        }
+    }
+
+    #[test]
+    fn exact_dedupe_does_not_clamp_or_round() {
+        let items = [(1, Color::lab(105.0, 0.0, 0.0)), (2, Color::lab(130.0, 0.0, 0.0))];
+        assert_eq!(cluster_colors_by_delta_e(&items, 0.0).len(), 2, "L 105 and 130 are different colours");
+        let items = [(1, Color::lab(-5.0, 0.0, 0.0)), (2, Color::lab(-10.0, 0.0, 0.0))];
+        assert_eq!(cluster_colors_by_delta_e(&items, 0.0).len(), 2);
+        // −0.0 and 0.0 are the same colour.
+        let items = [(1, Color::lab(50.0, -0.0, 0.0)), (2, Color::lab(50.0, 0.0, 0.0))];
+        assert_eq!(cluster_colors_by_delta_e(&items, 0.0).len(), 1);
+        assert!(ExactKey::of(&Color::rgb(0.0, 0.5, 1.0)) == ExactKey::of(&Color::rgb(-0.0, 0.5, 1.0)));
+        assert!(ExactKey::of(&Color::rgb(0.5, 0.5, 0.5)) != ExactKey::of(&Color::gray(0.5)));
+    }
+
+    #[test]
+    fn test_cluster_weights_sanitized() {
+        let colors = [Color::rgb(1.0, 0.0, 0.0), Color::rgb(0.0, 1.0, 0.0)];
+        let weights = [f32::NAN, -5.0];
+        let res = cluster(&colors, &weights, 2);
+        assert_eq!(res.len(), 2);
+    }
+
+    #[test]
+    fn test_row_map_nan_lightness() {
+        let rm = RowMap::new(Method::Exact, &[Color::rgb(1.0, 0.0, 0.0)], Color::rgb(0.0, 0.0, 1.0));
+        let nan_color = Color::lab(f32::NAN, 0.0, 0.0);
+        let out = rm.map(nan_color);
+        assert!(out.to_lab().l.is_nan());
     }
 }

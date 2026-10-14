@@ -199,12 +199,33 @@ struct Found {
     bytes: Option<Vec<u8>>,
 }
 
+pub const MAX_LINK_BYTES: u64 = 256 * 1024 * 1024;
+
 impl Found {
     /// The file's bytes (read now unless already read).
     fn read(&mut self) -> Result<Vec<u8>> {
         match self.bytes.take() {
-            Some(b) => Ok(b),
-            None => read_file(&self.path),
+            Some(b) => {
+                if b.len() as u64 > MAX_LINK_BYTES {
+                    return Err(EngineError::Other("linked file exceeds maximum size".into()));
+                }
+                Ok(b)
+            }
+            None => {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    if let Ok(meta) = std::fs::metadata(&self.path)
+                        && meta.len() > MAX_LINK_BYTES
+                    {
+                        return Err(EngineError::Other("linked file exceeds maximum size".into()));
+                    }
+                }
+                let bytes = read_file(&self.path)?;
+                if bytes.len() as u64 > MAX_LINK_BYTES {
+                    return Err(EngineError::Other("linked file exceeds maximum size".into()));
+                }
+                Ok(bytes)
+            }
         }
     }
 
@@ -233,19 +254,26 @@ fn found_at(path: String) -> Option<Found> {
 
 /// Where the file of `link` is: at its path, else at its relative path or by name in the
 /// document's folder `dir`.
-fn locate(link: &LinkInfo, dir: Option<&Path>) -> Option<Found> {
+fn find_link(link: &LinkInfo, dir: Option<&Path>) -> Option<Found> {
     let mut paths = vec![link.path.clone()];
     if let Some(dir) = dir {
-        let near = link.relative.iter().map(|r| dir.join(r)).chain([dir.join(link.name())]);
+        let safe_rel = link.relative.as_deref().filter(|rel| {
+            !rel.contains('\0') && !Path::new(rel).components().any(|c| matches!(c, Component::ParentDir | Component::RootDir | Component::Prefix(_)))
+        });
+        let near = safe_rel.map(|r| dir.join(r)).into_iter().chain([dir.join(link.name())]);
         paths.extend(near.map(|p| p.to_string_lossy().into_owned()));
     }
     paths.into_iter().find_map(found_at)
 }
 
+fn locate(link: &LinkInfo, dir: Option<&Path>) -> Option<Found> {
+    find_link(link, dir)
+}
+
 /// Where the file of group `g` is and whether it still has the content shown. Its bytes are read
 /// only when its size or modification time changed.
 fn probe(g: &Group, dir: Option<&Path>) -> (Status, Option<Found>) {
-    let Some(mut f) = locate(&g.link, dir) else { return (Status::Missing, None) };
+    let Some(mut f) = find_link(&g.link, dir) else { return (Status::Missing, None) };
     let l = &g.link;
     if l.size == Some(f.size) && l.modified.is_some() && l.modified == f.modified {
         return (Status::Ok, Some(f));

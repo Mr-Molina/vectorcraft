@@ -150,14 +150,26 @@ pub fn install() {
     log::set_max_level(LevelFilter::Off);
 }
 
+/// A guard that resets the global logging level on drop.
+#[cfg(test)]
+pub struct TestLogGuard(#[expect(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+#[cfg(test)]
+impl Drop for TestLogGuard {
+    fn drop(&mut self) {
+        let _ = set_level(None);
+    }
+}
+
 /// The level and the queue are process-wide, so the tests that move them take turns. The server
 /// itself is one thread, so nothing else has to.
 #[cfg(test)]
-pub(crate) fn test_turn() -> std::sync::MutexGuard<'static, ()> {
-    match TEST_LOCK.lock() {
+pub(crate) fn test_turn() -> TestLogGuard {
+    let guard = match TEST_LOCK.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
-    }
+    };
+    TestLogGuard(guard)
 }
 
 #[cfg(test)]
